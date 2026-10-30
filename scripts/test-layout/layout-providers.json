@@ -3,6 +3,11 @@
   "claude-cli-session-manager.test.ts": "providers",
   "claude-cli-session-worker.test.ts": "providers",
   "claude-cli-session-http.test.ts": "providers",
+  "claude-cli-session-context.test.ts": "providers",
+  "claude-cli-session-recovery.test.ts": "providers",
+  "claude-cli-session-retention.test.ts": "providers",
+  "claude-cli-session-lifecycle.test.ts": "providers",
+  "claude-cli-session-native.test.ts": "providers",
   "free-directory-runcrate.test.ts": "providers",
   "cc-switch-import.test.ts": "providers",
   "kiro-completion-with-real-tools.test.ts": "providers/kiro"

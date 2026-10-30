@@ -4,14 +4,42 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { getConfigDir } from "../../config/paths";
 import { isTestHomeGuardArmed } from "../../lib/test-home-guard";
+import { modelRecordValue } from "../../reasoning-effort";
 import { namespacedToolName, type OcxMessage, type OcxParsedRequest, type OcxProviderConfig } from "../../types";
 import type { IncomingMeta } from "../base";
-import { canonicalClaudeJson } from "./stable-replay";
+import type { CodeBuddyToolBridge } from "../codebuddy/tool-bridge";
+import { projectedHistoryCharLimit } from "../coding-agent/protocol";
+import { buildStableClaudeConversationInput, canonicalClaudeJson } from "./stable-replay";
 
 export function claudeDigest(value: unknown): string {
   // Parsed requests can contain optional undefined properties, unlike their JSON wire form.
   const json = JSON.parse(JSON.stringify(value));
   return createHash("sha256").update(JSON.stringify(canonicalClaudeJson(json))).digest("hex");
+}
+
+/** Only caller-stable operation IDs can authorize replay of a completed text response. */
+export function claudeOperationIdentity(parsed: OcxParsedRequest, incoming: IncomingMeta): string | undefined {
+  const valid = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0
+    && value.length <= 4096 && !/[\x00-\x1f\x7f-\x9f]/.test(value);
+  const key = incoming.idempotencyKey ?? incoming.headers.get("idempotency-key");
+  if (valid(key)) return claudeDigest(["idempotency-key", key]);
+  const body = parsed._rawBody;
+  const metadata = body && typeof body === "object" && "client_metadata" in body ? body.client_metadata : undefined;
+  const turnId = metadata && typeof metadata === "object" && "turn_id" in metadata ? metadata.turn_id : undefined;
+  if (valid(turnId)) return claudeDigest(["turn-id", turnId]);
+  const header = incoming.headers.get("x-codex-turn-metadata");
+  if (!header || header.length > 8192) return undefined;
+  try {
+    const turn = JSON.parse(header)?.turn_id;
+    return valid(turn) ? claudeDigest(["turn-id", turn]) : undefined;
+  } catch { return undefined; }
+}
+
+export function buildClaudeSessionBootstrap(parsed: OcxParsedRequest, provider: OcxProviderConfig, bridge: CodeBuddyToolBridge): string {
+  const maxHistoryChars = projectedHistoryCharLimit(modelRecordValue(provider.modelContextWindows, parsed.modelId) ?? provider.contextWindow);
+  const vendorNameByWire = new Map([...bridge.emittedNameMap].map(([emitted, wire]) => [wire, emitted]));
+  const frame = JSON.parse(buildStableClaudeConversationInput(parsed, { maxHistoryChars, vendorNameByWire })[0]!);
+  return frame.message.content.map((part: { text: string }) => part.text).join("\n\n");
 }
 
 /** A parent thread and a prompt-cache cohort must never merge parallel child conversations. */
@@ -81,6 +109,20 @@ export function claudeHistory(messages: OcxMessage[]): string[] {
 
 export function historyExtends(history: string[], prefix: string[]): boolean {
   return history.length >= prefix.length && prefix.every((hash, index) => history[index] === hash);
+}
+
+/** Native MCP completion must not skip any new instruction in the supplied history. */
+export function claudeToolResultContinuation(messages: OcxMessage[], prefixHistory: string[], expectedCallIds: ReadonlySet<string>): boolean {
+  let suffix = messages.length;
+  while (suffix > 0) {
+    const message = messages[suffix - 1]!;
+    if (message.role !== "toolResult") break;
+    if (!expectedCallIds.has(message.toolCallId)) return false;
+    suffix--;
+  }
+  if (suffix === messages.length) return false;
+  const prefix = claudeHistory(messages.slice(0, suffix));
+  return prefix.length === prefixHistory.length && historyExtends(prefix, prefixHistory);
 }
 
 export function claudeUserText(message: OcxMessage): string {

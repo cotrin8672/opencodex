@@ -39,7 +39,7 @@ export function turn(messages: OcxMessage[] = [user("read both files")]): Claude
       },
     }] },
   };
-  const incoming = { headers: new Headers({ "thread-id": "offline-thread" }), providerName: "claude-cli", translatorBudget: createTestTranslatorBudget() };
+  const incoming = { headers: new Headers({ "thread-id": "offline-thread", "idempotency-key": "offline-operation" }), providerName: "claude-cli", translatorBudget: createTestTranslatorBudget() };
   const provider = { adapter: "claude-cli", baseUrl: "claude-cli://offline" };
   return {
     scope: claudeSessionScope(parsed, incoming, provider)!, parsed, incoming, provider,

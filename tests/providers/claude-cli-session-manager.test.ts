@@ -425,9 +425,8 @@ describe("Claude persistent session manager (offline adversarial)", () => {
     const cancelled = h.run({ ...input, incoming: { ...input.incoming, abortSignal: abort.signal } });
     abort.abort();
     await cancelled.done;
-    expect(h.workers).toHaveLength(1);
-    expect(h.workers[0]!.sends).toEqual([]);
-    expect(h.workers[0]!.stops).toBe(1);
+    expect(h.workers.flatMap(worker => worker.sends)).toEqual([]);
+    expect(h.workers.every(worker => worker.stops === 1)).toBe(true);
     expect(cancelled.events).toEqual([]);
     const retry = await h.start(input);
     await retry.worker.finish("only inference");
@@ -435,20 +434,21 @@ describe("Claude persistent session manager (offline adversarial)", () => {
     expect(h.workers.flatMap(worker => worker.sends)).toHaveLength(1);
   });
 
-  test("rejects concurrent conflicting requests even during worker creation", async () => {
+  test("serializes concurrent setup and gives the newest input ownership", async () => {
     const h = harness();
     const input = turn();
     const first = h.run(input);
     const conflict = h.run(withMessages(input, [user("a conflicting instruction")]));
-    await expect(conflict.done).rejects.toMatchObject({ code: "claude_session_busy", status: 409, retryable: true });
-    await until(() => !!h.workers[0]?.sends.length);
-    const another = h.run(input);
-    await expect(another.done).rejects.toMatchObject({ code: "claude_session_busy" });
-    await h.workers[0]!.finish("owned response");
+    await until(() => !!h.workers[1]?.sends.length);
     await first.done;
-    expect(h.workers).toHaveLength(1);
-    expect(conflict.events).toEqual([]);
-    expect(another.events).toEqual([]);
+    expect(first.events.at(-1)).toMatchObject({ type: "error", code: "claude_turn_superseded" });
+    expect(h.workers[0]!.stops).toBe(1);
+    const another = h.run(withMessages(input, [user("a conflicting instruction")]));
+    await conflict.done;
+    await h.workers[1]!.finish("owned response");
+    await another.done;
+    expect(h.workers).toHaveLength(2);
+    expect(another.events.at(-1)).toMatchObject({ type: "done" });
   });
 
   test.each(["receipt", "delivery"])("journal %s failure releases no external action", async stage => {

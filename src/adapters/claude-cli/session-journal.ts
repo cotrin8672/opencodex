@@ -16,6 +16,8 @@ export interface ClaudeToolReceipt {
 
 export interface ClaudeTurnReceipt {
   inputHash: string;
+  requestHash?: string;
+  operationId?: string;
   historyHash?: string;
   phase: "running" | "tools" | "completed" | "interrupted" | "expired";
   events: AdapterEvent[];
@@ -88,7 +90,7 @@ const eventSchemas = {
 const snapshotSchema: z.ZodType<ClaudeSessionSnapshot> = z.strictObject({
   version: z.literal(1), history: z.array(hash),
   turns: z.array(z.strictObject({
-    inputHash: hash, historyHash: hash.optional(), phase: z.enum(["running", "tools", "completed", "interrupted", "expired"]),
+    inputHash: hash, requestHash: hash.optional(), operationId: hash.optional(), historyHash: hash.optional(), phase: z.enum(["running", "tools", "completed", "interrupted", "expired"]),
     events: z.array(z.union(Object.values(eventSchemas))),
     calls: z.array(z.strictObject({
       id: z.string().min(1), name: z.string().min(1), arguments: z.string(),

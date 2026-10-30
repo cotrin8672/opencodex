@@ -20,6 +20,9 @@ per account, and an observer without a final-send report never attributes a resp
 observer had reported. Regression coverage:
 `tests/responses/responses-account-auto-pause-wire-owner.test.ts`.
 
+The runTurn wrapper retains a caller replay key as internal adapter metadata, independently
+of outbound credential headers; a cached Claude receipt performs no send or account observation.
+
 DeepSeek's expiring image uploads during adapter construction use the captured credential
 selection fence, but are not inference attempts and do not contribute to account refusal
 counters. Their transport and lifetime follow the [Responses image replay contract](transports/responses.md#fetch-helper-import-boundary).

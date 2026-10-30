@@ -36,3 +36,7 @@ retry and queued rebuilds through `src/server/responses/adapter-dispatch.ts` and
 `src/server/responses/request-transport.ts`; missing metadata keeps earlier tool delivery off.
 This structural mechanism does not alter supplier bodies, reasoning effort, retry policy,
 settlement or provider-opaque replay scope.
+
+The runTurn wrapper also retains the ingress `idempotency-key` as internal adapter metadata
+for Claude receipt replay, independently of the filtered outbound headers. It grants no
+structural membership or execution permission; Chat and Messages bridges retain it internally.

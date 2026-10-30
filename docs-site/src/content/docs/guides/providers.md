@@ -1503,7 +1503,8 @@ CLI headlessly, retaining a native conversation for clients that supply their ow
   feedback and the auto-updater disabled. Built-in tools and setting sources are disabled, and strict
   MCP isolation admits only the client's selected tools. The harness loads no CLAUDE.md, skill,
   hook, plugin or other MCP server from the machine; file access, shell commands and browsing
-  remain external client actions.
+  remain external client actions. Persistent workers drain and discard stderr so verbose private
+  diagnostics cannot stall generation; process and stderr-read failures report generic errors.
 - **System prompt:** the caller's system and developer prompts replace the Claude Code preset
   through stdin in persistent mode, keeping prompt text out of process arguments. One-shot
   compatibility stages the folded prompt in a private per-turn file (mode `0600`) and passes only
@@ -1513,24 +1514,34 @@ CLI headlessly, retaining a native conversation for clients that supply their ow
   thread IDs and prompt-cache keys do not select or share one. Without an own identity, requests
   retain isolated one-shot compatibility. A cold start or history rebase uses the full stable text
   projection, trimmed only at message boundaries; later user turns use Claude's native context.
+  Different input during generation stops the old owned worker and starts a fresh one from the full
+  latest client history, including intervening instructions. Conversation IDs remain isolated by
+  proxy home, client identity, provider/destination, and conversation versus compaction purpose.
   Claude Code controls prompt-cache breakpoints, so cache savings are not guaranteed.
 - **Tool ownership:** Codex, Pi, or another external client owns approval, sandboxing and execution.
-  In persistent mode the isolated MCP call waits for that client's real result, then Claude
-  continues in the same worker. Return every result under its original call ID and preserve its
-  content and error flag. One-shot compatibility ends the CLI after capturing a tool batch and
+  In persistent mode, actual started MCP calls hand off sequentially without marking tools parallel.
+  Each call waits for the client's real result before Claude continues. Return every result under
+  its original call ID and preserve its namespace, content and error flag.
+  One-shot compatibility ends the CLI after capturing a tool batch and
   replays the client's results in the next request.
 - **Disconnects and retries:** in persistent mode, the same active input can reconnect for 30 seconds
   after an HTTP disconnect. Idle workers stop after 30 minutes, with at most 16 live workers.
-  Completed text responses can replay from the private receipt journal without new model usage. After a proxy
-  restart, return the original tool results in client history so a fresh worker can continue;
+  Completed text responses replay without new model usage only for matching input with the same stable
+  `idempotency-key` header or `client_metadata.turn_id`; identical text or a conversation ID alone
+  does not authorize completed replay. Session errors retain status, code, retryability and available
+  usage/error-type metadata. After a proxy restart, a fresh worker uses client history and saved results;
   native SDK session resume is not guaranteed.
 - **Uncertain tool delivery:** in persistent mode, receipts and a delivery marker are committed to
-  the private SQLite journal before calls reach the client. A batch captured while disconnected
-  can be delivered once if delivery never started. A retry after delivery started receives HTTP 409
-  `claude_tool_delivery_uncertain` instead of another tool batch. Missing results produce
+  the private SQLite journal before calls reach the client. An undelivered handoff can be delivered
+  on reconnect only if delivery never started; issued actions are not automatically reissued.
+  Incoming results are staged and committed before continuation. Saved results omitted from history
+  are restored only beside their unique matching original assistant calls, preserving namespaces;
+  a missing or ambiguous call, a conflict, or a failed commit fails closed. Uncertain delivery produces
+  `claude_tool_delivery_uncertain` (HTTP 409). Missing results produce
   `claude_tool_results_pending` (a 400/409 client error), and changed recorded results produce
-  `claude_tool_result_conflict`. Verify whether the action ran and return its existing results;
-  do not automatically execute it again. External actions have no global exactly-once guarantee.
+  `claude_tool_result_conflict`. An issued host action with an unknown result still needs its original
+  result before continuation, including after input changes. Verify whether it ran; do not automatically
+  execute it again. Delivery and execution have no exactly-once guarantee.
   The journal under the OpenCodex home contains private tool arguments and outputs.
 - **Subscription limits:** before each request OpenCodex asks Anthropic's usage endpoint, with the
   CLI's own sign-in read in memory, whether the plan's 5-hour, weekly or model-specific window is

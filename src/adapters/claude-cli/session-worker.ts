@@ -165,6 +165,10 @@ export async function createClaudeSessionWorker(options: ClaudeWorkerOptions): P
             detached: process.platform !== "win32",
           });
           child = ownedChild;
+          ownedChild.on("error", () => fail(new Error("Claude CLI process failed")));
+          ownedChild.stderr.on("error", () => fail(new Error("Claude CLI stderr read failed")));
+          // Custom SDK spawns must drain stderr; discard it to keep diagnostics private.
+          ownedChild.stderr.resume();
           return ownedChild;
         },
       },

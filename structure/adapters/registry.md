@@ -37,10 +37,13 @@ Some adapters share another adapter's routed-tool semantics while retaining inde
 - `claude-cli` inherits the `codebuddy` stream-event and client tool-ownership contract, with
   independent session ownership in `src/adapters/claude-cli/`. An explicit own conversation ID
   selects an official SDK worker; requests without one retain the shared one-shot runner.
-  Native context, pending external MCP results, durable receipts, reconnect behavior, and isolation
+  Different midstream input stops the owned worker and bootstraps full latest history; the same
+  active input reconnects to its generation. Actual started MCP calls hand off sequentially without
+  blanket concurrency annotations, preserving tool namespaces and real client results.
+  Completed text replay with a stable operation ID, staged result recovery, error metadata, and isolation
   follow [Claude persistent sessions](../providers/claude-cli-replay.md#persistent-sessions).
   The CLI reads the operator's own sign-in; neither path requires or injects an API key, and the
-  scoped child environment carries no inherited `ANTHROPIC_*` value.
+  scoped child environment carries no inherited `ANTHROPIC_*` value. Owned stderr is drained and discarded.
   Its registry row is `authKind: "key"` with `keyOptional: true`, NOT `local`: the turn leaves the
   machine for `api.anthropic.com`, and `local` (Ollama, vLLM, LM Studio) is the classification for
   traffic that never does. `keyOptional` is the existing exemption from key enforcement, and key

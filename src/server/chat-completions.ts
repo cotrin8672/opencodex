@@ -480,6 +480,8 @@ async function handleChatCompletionsWithBudget(
   const callerDirectAuth = captureCallerDirectAuth(req.headers, config);
   let openAiSidecarAuth = nativeCallerAuth;
   const headers = new Headers({ "content-type": "application/json" });
+  const idempotencyKey = req.headers.get("idempotency-key");
+  if (idempotencyKey) headers.set("idempotency-key", idempotencyKey);
   // Internal bridge metadata; the Go resolver scopes and hashes it before upstream use.
   const openCodeSession = req.headers.get("x-opencode-session");
   if (openCodeSession) headers.set("x-opencode-session", openCodeSession);

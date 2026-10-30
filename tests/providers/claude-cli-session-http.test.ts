@@ -89,7 +89,7 @@ async function withHttp(run: (http: {
     });
     const url = `http://127.0.0.1:${server.port}/v1/responses`;
     await run({ h, signals, post: (body, signal) => fetch(url, {
-      method: "POST", headers: { "content-type": "application/json", "thread-id": "own-http-thread" },
+      method: "POST", headers: { "content-type": "application/json", "thread-id": "own-http-thread", "idempotency-key": "offline-http-operation" },
       body: JSON.stringify({ model: "claude-cli/claude-sonnet-5-5", stream: true, store: true, tools, ...body }),
       signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(5_000)]) : AbortSignal.timeout(5_000),
     }) });

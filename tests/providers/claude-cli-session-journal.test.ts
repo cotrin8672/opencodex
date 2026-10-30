@@ -95,6 +95,22 @@ test.each([undefined, false, true])("preserves deliveryStarted=%s across reopen 
   expect(open().load(scope)).toEqual(saved);
 });
 
+test.each([undefined, "a".repeat(64), "B".repeat(64)])("preserves optional v1 operationId=%s across reopen", operationId => {
+  const saved = snapshot();
+  if (operationId !== undefined) saved.turns[0]!.operationId = operationId;
+  open().save(scope, saved);
+  journal!.close();
+  expect(open().load(scope)).toEqual(saved);
+});
+
+test.each([undefined, "a".repeat(64), "B".repeat(64)])("preserves optional v1 requestHash=%s across reopen", requestHash => {
+  const saved = snapshot();
+  if (requestHash !== undefined) saved.turns[0]!.requestHash = requestHash;
+  open().save(scope, saved);
+  journal!.close();
+  expect(open().load(scope)).toEqual(saved);
+});
+
 test.each(["running", "tools", "completed", "interrupted", "expired"] as const)("accepts %s receipts without delivery metadata", phase => {
   const saved = snapshot();
   saved.turns[0]!.phase = phase;
@@ -144,6 +160,8 @@ test("rejects malformed, unsupported, and out-of-bounds snapshots on save and lo
     null, [], {}, { ...valid, version: 2 }, { ...valid, extra: "unexpected" },
     { ...valid, history: ["not a hash"] }, { ...valid, history: "history" }, { ...valid, turns: {} },
     withTurn({ inputHash: "invalid" }), withTurn({ phase: "pending" }),
+    ...["", "a".repeat(63), "a".repeat(65), "g".repeat(64), null, 123].map(operationId => withTurn({ operationId })),
+    ...["", "a".repeat(63), "a".repeat(65), "g".repeat(64), null, 123].map(requestHash => withTurn({ requestHash })),
     withTurn({ updatedAt: -1 }), withTurn({ updatedAt: NaN }), withTurn({ updatedAt: Infinity }),
     withTurn({ updatedAt: 0.5 }), withTurn({ updatedAt: Number.MAX_SAFE_INTEGER + 1 }),
     withTurn({ deliveryStarted: "true" }), withTurn({ deliveryStarted: null }),

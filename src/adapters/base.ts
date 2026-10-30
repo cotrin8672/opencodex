@@ -12,6 +12,8 @@ export interface IncomingMeta {
   providerName?: string;
   /** Trusted, restart-stable caller namespace; never copied from a client principal header. */
   durableClientPrincipalId?: string;
+  /** Caller-supplied replay key, retained internally when outbound header filtering removes it. */
+  idempotencyKey?: string;
   /** Trusted caller has durable structural replay ownership for earlier completed tools. */
   completedToolBlocks?: boolean;
   translatorBudget: TranslatorBudget;

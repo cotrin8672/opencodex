@@ -26,3 +26,6 @@ without that context. The Responses owner derives that metadata from authenticat
 `src/adapters/unique-tool-call-ids.ts` forwards this context without changing its call-ID reminting.
 Only the signed canonical delivery supplies it; direct client encoders, advisor guards,
 compaction and other parser consumers leave it absent.
+
+`IncomingMeta.idempotencyKey` separately carries a caller-supplied replay key to persistent
+Claude sessions; it grants no completed-tool-block authority and is not an outbound header.

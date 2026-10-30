@@ -696,7 +696,7 @@ export async function prepareResponsesTransport(
       const runTurn = resolved.runTurn.bind(resolved);
       rawRunTurns.set(resolved, (requestParsed, incoming, emit) => {
         const response = {};
-        return runTurn(requestParsed, { ...incoming, durableClientPrincipalId }, event => { observeEvent(event, response); emit(event); });
+        return runTurn(requestParsed, { ...incoming, durableClientPrincipalId, idempotencyKey: req.headers.get("idempotency-key") ?? undefined }, event => { observeEvent(event, response); emit(event); });
       });
       resolved.runTurn = (requestParsed, incoming, emit) => runSelectedTurn(resolved, requestParsed, incoming, emit);
     }

@@ -3,10 +3,12 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolResultSchema, ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, test } from "bun:test";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import { createClaudeSessionWorker, type ClaudeSessionWorker, type ClaudeWorkerOptions } from "../../src/adapters/claude-cli/session-worker";
 import type { CodingAgentMcpTool } from "../../src/adapters/coding-agent/mcp-server";
+import { fixturePath } from "../helpers/repo-root";
 
 const tool: CodingAgentMcpTool = {
   name: "run",
@@ -340,6 +342,70 @@ describe("Claude SDK persistent session worker", () => {
     expect(argv.join(" ")).not.toContain(prompt);
     expect(argv.some(arg => /^--(?:append-)?system-prompt(?:=|$)/.test(arg))).toBe(false);
     expect(errors).toEqual([]);
+  });
+
+  test("drains a real owned child's stderr through the installed SDK without blocking results", async () => {
+    let child!: ChildProcessWithoutNullStreams;
+    const result = deferred<Record<string, unknown>>();
+    const errors: Error[] = [];
+    const worker = await createClaudeSessionWorker({
+      binary: process.execPath, model: "offline-model", systemPrompt: "Private offline prompt", env: {}, tools: [],
+      query: params => officialQuery({
+        ...params,
+        options: { ...params.options, spawnClaudeCodeProcess: launch => {
+          child = params.options!.spawnClaudeCodeProcess!({
+            ...launch, command: process.execPath, args: [fixturePath("claude-session-stderr-child.cjs")],
+          }) as ChildProcessWithoutNullStreams;
+          return child;
+        } },
+      }),
+      onMessage: message => { if (message.type === "result") result.resolve(message); },
+      onToolCall: async () => { throw new Error("No tools should run"); },
+      onError: error => { errors.push(error); },
+    });
+    active.push(worker);
+    worker.send("offline stderr probe");
+    expect(await result.promise).toMatchObject({ result: "stderr drained", stderr_bytes: 16 * 1024 * 1024 });
+    expect(child.exitCode).toBeNull();
+    expect(child.signalCode).toBeNull();
+    expect(child.stderr.readableLength).toBeLessThan(64 * 1024);
+    let exited = false;
+    child.once("exit", () => { exited = true; });
+    worker.stop();
+    await until(() => exited);
+    expect(errors).toEqual([]);
+  }, 10_000);
+
+  test.each(["stderr", "process"])("handles owned %s errors once without exposing private diagnostics", async source => {
+    const h = await harness();
+    const child = h.options.spawnClaudeCodeProcess!({
+      command: process.execPath, args: ["-e", "process.stdout.write('ready'); setInterval(() => {}, 1000)"],
+      env: {}, signal: new AbortController().signal,
+    }) as ChildProcessWithoutNullStreams;
+    await new Promise<void>(resolve => { child.stdout.once("data", () => resolve()); });
+    let exited = false;
+    child.once("exit", () => { exited = true; });
+    const target = source === "stderr" ? child.stderr : child;
+    target.emit("error", new Error("Private prompt, argv, and environment diagnostics"));
+    await until(() => exited);
+    expect(h.errors.map(error => error.message)).toEqual([
+      source === "stderr" ? "Claude CLI stderr read failed" : "Claude CLI process failed",
+    ]);
+    expect(() => h.worker.send("after failure")).toThrow("stopped");
+    target.emit("error", new Error("Late private diagnostic"));
+    h.worker.stop();
+    expect(h.errors).toHaveLength(1);
+  });
+
+  test("handles an asynchronous spawn failure without exposing its command or arguments", async () => {
+    const h = await harness();
+    h.options.spawnClaudeCodeProcess!({
+      command: fixturePath("missing-private-claude-executable"), args: ["private argument"],
+      env: {}, signal: new AbortController().signal,
+    });
+    await until(() => h.errors.length === 1);
+    expect(h.errors[0].message).toBe("Claude CLI process failed");
+    expect(() => h.worker.send("after failure")).toThrow("stopped");
   });
 
   test.each(["end", "error"])("reports unexpected SDK %s exactly once", async mode => {

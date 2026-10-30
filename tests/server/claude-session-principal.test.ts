@@ -203,6 +203,7 @@ test.each(["responses", "chat", "messages", "combo", "captured-unknown"] as cons
       async *parseStream() {},
       async runTurn(_parsed, incoming, emit) {
         expect(incoming.headers.has("x-opencodex-api-key")).toBe(false);
+        expect(incoming.idempotencyKey).toBe("offline-caller-operation");
         seen.push(incoming.durableClientPrincipalId);
         emit({ type: "text_delta", text: "fixture answer" });
         emit({ type: "done", usage: { inputTokens: 1, outputTokens: 1 } });
@@ -214,7 +215,7 @@ test.each(["responses", "chat", "messages", "combo", "captured-unknown"] as cons
     const body = responses ? { input: "hello" } : { messages: [{ role: "user", content: "hello" }], max_tokens: 64 };
     const req = new Request(`http://localhost/v1/${responses ? "responses" : surface === "chat" ? "chat/completions" : surface}`, {
       method: "POST", headers: { "content-type": "application/json", "x-opencodex-api-key": keyA,
-        authorization: "Bearer fixture", "thread-id": "own-session" },
+        authorization: "Bearer fixture", "thread-id": "own-session", "idempotency-key": "offline-caller-operation" },
       body: JSON.stringify({ model: surface === "combo" ? "combo/durable" : "claude-cli/claude-sonnet-5-5", stream: false, ...body }),
     });
     const admission = resolveResponsesApiAuth(req, cfg)!;
