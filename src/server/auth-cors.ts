@@ -1,6 +1,6 @@
 import { providerRelativeSendPathConfigError } from "../config/provider-relative-send-path";
 import { contextTierRecordConfigError, modelCapabilitiesConfigError, providerInputModalitiesConfigError } from "../config/provider-validation";
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { initialModelSelection } from "../providers/initial-model-selection";
 import { extractAccountId } from "../oauth/chatgpt";
 import { formatErrorResponse } from "../bridge";
@@ -513,6 +513,38 @@ export function resolveContextPrincipal(req: Request, config: OcxConfig, admissi
     if (principal) return principal;
   }
   return undefined;
+}
+
+/** Durable ownership for an already-admitted caller; this never grants admission. */
+export function resolveDurableSessionPrincipal(
+  req: Request,
+  config: Pick<OcxConfig, "apiKeys">,
+  admission: DataPlaneAdmission | undefined,
+): string | undefined {
+  if (!admission) return undefined;
+  const candidates = [
+    [req.headers.get("x-opencodex-api-key")?.trim(), "dedicated"],
+    [authorizationCredential(req.headers), "bearer"],
+    [req.headers.get("x-api-key")?.trim(), "x-api-key"],
+  ] as const;
+  let owner = admission;
+  let credential = "";
+  for (const [token, source] of candidates) {
+    if (!token || (admission.kind !== "loopback" && source !== admission.source)) continue;
+    const resolved = resolveDataPlaneAdmissionSecret(token, config, source);
+    if (!resolved) continue;
+    if (admission.kind !== "loopback" && (resolved.kind !== admission.kind
+      || (admission.kind === "configured" && (resolved.kind !== "configured" || resolved.keyId !== admission.keyId))
+      || (contextPrincipalIdOf(admission) !== undefined && contextPrincipalIdOf(resolved) !== contextPrincipalIdOf(admission)))) return undefined;
+    owner = resolved;
+    credential = token;
+    break;
+  }
+  if (!credential && admission.kind !== "loopback") return undefined;
+  // An unrelated upstream bearer cannot rename the credentialless local operator.
+  return createHash("sha256").update("opencodex.durable-session-principal.v1\0")
+    .update(JSON.stringify([owner.kind, owner.kind === "configured" ? owner.keyId : "", credential]))
+    .digest("hex");
 }
 
 /** Stable structural replay identity. This does not replace process-local opaque-state ownership. */

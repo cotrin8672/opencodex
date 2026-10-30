@@ -1,6 +1,6 @@
 {
   "name": "@bitkyc08/opencodex",
-  "version": "2.95.0",
+  "version": "2.95.0-claude-json.1",
   "description": "Universal provider proxy for OpenAI Codex & Claude Code — use any LLM with Codex CLI/App/SDK and Claude Code",
   "type": "module",
   "main": "./bin/package-main.mjs",
@@ -82,6 +82,7 @@
     "setup:hooks": "bun scripts/setup-hooks.ts"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.314",
     "@bufbuild/protobuf": "^2.14.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "@napi-rs/keyring": "1.3.0",

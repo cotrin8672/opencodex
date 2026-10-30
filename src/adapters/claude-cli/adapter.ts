@@ -9,9 +9,15 @@ import { mapReasoningEffort } from "../../reasoning-effort";
 import { buildSystemPrompt } from "../coding-agent/protocol";
 import { baseScopedEnv, runCodingAgentTurn, type CodingAgentDeps, type CodingAgentToolBridgeInput } from "../coding-agent/turn";
 import { whichFromPath, type WhichFn } from "../coding-agent/profile";
+import { isBatchDispatcher, resolveCodingAgentBinary, resolveProfileByBaseUrl } from "../coding-agent/profile";
+import { redactSecrets } from "../coding-agent/turn";
+import { SendBudgetExhaustedError } from "../../lib/upstream-retry";
+import { claudeSessionScope } from "./session-context";
+import type { ClaudeSessionManager } from "./session-manager";
 import {
   buildCodeBuddyToolBridge,
   CODEBUDDY_MCP_SERVER_NAME,
+  CODEBUDDY_MCP_TOOL_PREFIX,
   CODEBUDDY_TOOL_LIMITS,
 } from "../codebuddy/tool-bridge";
 import { CLAUDE_CLI_PROFILES, type ClaudeCliProfile } from "./profiles";
@@ -31,6 +37,8 @@ const TOOL_BRIDGE_SYSTEM_PROMPT = [
 
 export type { SpawnFn } from "../coding-agent/turn";
 export type ClaudeCliAdapterDeps = CodingAgentDeps & {
+  /** Conversation owner override for isolated integration tests. */
+  sessionManager?: ClaudeSessionManager;
   /** Subscription preflight; defaults to the cached local quota read. */
   usageAdmission?: (model: string) => Promise<ClaudeAdmission>;
   /** Records a limit the CLI itself reported; defaults to the shared admission cache. */
@@ -199,6 +207,7 @@ export function withClaudeLoginHint(emit: (event: AdapterEvent) => void): (event
 export function createClaudeCliAdapter(provider: OcxProviderConfig, deps: ClaudeCliAdapterDeps = {}): ProviderAdapter {
   return {
     name: "claude-cli",
+    reportsPhysicalSends: true,
 
     buildRequest(): AdapterRequest {
       return { url: provider.baseUrl, method: "POST", headers: {}, body: "" };
@@ -238,6 +247,52 @@ export function createClaudeCliAdapter(provider: OcxProviderConfig, deps: Claude
         });
         return;
       }
+      const scope = claudeSessionScope(parsed, incoming, provider);
+      if (scope) {
+        const profile = resolveProfileByBaseUrl(CLAUDE_CLI_PROFILES, provider.baseUrl);
+        if (!profile) {
+          emit({ type: "error", message: "Provider base URL is not a canonical Claude destination.", status: 400,
+            errorType: "invalid_request_error", code: "non_canonical_destination", retryable: false });
+          return;
+        }
+        const binary = resolveCodingAgentBinary(profile, deps.which ?? findClaudeCliBinary);
+        if (!binary) {
+          emit({ type: "error", message: `Claude Code CLI not found. Install it with: ${profile.installHint}`, status: 500,
+            errorType: "upstream_error", code: "cli_not_found", retryable: false });
+          return;
+        }
+        if (isBatchDispatcher(binary)) {
+          emit({ type: "error", message: "Persistent Claude sessions require the native Claude executable; put claude.exe on PATH.", status: 500,
+            errorType: "upstream_error", code: "cli_native_binary_required", retryable: false });
+          return;
+        }
+        const { getClaudeSessionManager, ClaudeSessionError } = await import("./session-manager");
+        const nativeBridge = { ...bridge, tools: bridge.tools.map(tool => ({ ...tool,
+          description: `${tool.description}\nExternal client tool: ${bridge.emittedNameMap.get(`${CODEBUDDY_MCP_TOOL_PREFIX}${tool.name}`)}`,
+        })) };
+        const systemPrompt = [buildSystemPrompt(parsed), CLAUDE_REPLAY_SYSTEM_PROMPT, TOOL_BRIDGE_SYSTEM_PROMPT,
+          "Each MCP tool description identifies its external client tool name. Use that MCP tool for the corresponding client instruction."].filter(Boolean).join("\n\n");
+        const deliver = withClaudeLoginHint(event => emit(event.type === "error"
+          ? { ...event, message: redactSecrets(event.message, undefined, provider.apiKey) } : event));
+        try {
+          await (deps.sessionManager ?? getClaudeSessionManager()).run({ scope, parsed, incoming, provider, binary,
+            env: buildChildEnv(profile as ClaudeCliProfile, ""), systemPrompt, bridge: nativeBridge,
+            effort: mapReasoningEffort(provider, parsed.modelId, parsed.options.reasoning),
+            onCliOutputError: message => {
+              if (containsClaudeResetClock(parsed.modelId)) return;
+              void Promise.resolve().then(() => (deps.usageRefusal ?? recordClaudeUsageRefusal)(redactSecrets(message, undefined, provider.apiKey))).catch(() => {});
+            },
+          }, deliver);
+        } catch (error) {
+          if (error instanceof SendBudgetExhaustedError) throw error;
+          deliver({ type: "error", message: error instanceof Error ? error.message : String(error),
+            status: error instanceof ClaudeSessionError ? error.status : 503, errorType: "upstream_error",
+            code: error instanceof ClaudeSessionError ? error.code : "claude_session_unavailable",
+            retryable: error instanceof ClaudeSessionError ? error.retryable : false });
+        }
+        return;
+      }
+      // Headerless callers have no safe durable conversation owner; retain isolated one-shot compatibility.
       const toolBridge: CodingAgentToolBridgeInput | undefined = bridge.tools.length > 0
         ? {
             serverName: CODEBUDDY_MCP_SERVER_NAME,

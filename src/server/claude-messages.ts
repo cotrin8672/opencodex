@@ -105,6 +105,7 @@ import {
   isDataPlaneAdmissionSecret,
   isProxyAdmissionSecret,
   resolveContextPrincipal,
+  resolveDurableSessionPrincipal,
   type RequestPolicyView,
   type DataPlaneAdmission,
 } from "./auth-cors";
@@ -1135,6 +1136,7 @@ async function handleClaudeMessagesWithBudget(
     advisorAdmissionPolicy,
     // The translated request never forwards the caller credential; resolve the principal first.
     replayPrincipal: { clientPrincipalId: resolveContextPrincipal(req, config, logIds?.admission) },
+    durableClientPrincipalId: resolveDurableSessionPrincipal(req, config, logIds?.admission),
     ...(logIds?.turnAdmissionLease ? { turnAdmissionLease: logIds.turnAdmissionLease } : {}),
     abortSignal: req.signal,
     promptCacheKeyIsSharedCohort: cacheKeySource === "system",

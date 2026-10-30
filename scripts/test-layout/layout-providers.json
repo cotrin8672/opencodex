@@ -1,4 +1,8 @@
 {
+  "claude-cli-session-journal.test.ts": "providers",
+  "claude-cli-session-manager.test.ts": "providers",
+  "claude-cli-session-worker.test.ts": "providers",
+  "claude-cli-session-http.test.ts": "providers",
   "free-directory-runcrate.test.ts": "providers",
   "cc-switch-import.test.ts": "providers",
   "kiro-completion-with-real-tools.test.ts": "providers/kiro"

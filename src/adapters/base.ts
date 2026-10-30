@@ -10,6 +10,8 @@ export interface IncomingMeta {
   headers: Headers;
   /** Canonical routed provider identity for provider-specific wire fields. */
   providerName?: string;
+  /** Trusted, restart-stable caller namespace; never copied from a client principal header. */
+  durableClientPrincipalId?: string;
   /** Trusted caller has durable structural replay ownership for earlier completed tools. */
   completedToolBlocks?: boolean;
   translatorBudget: TranslatorBudget;

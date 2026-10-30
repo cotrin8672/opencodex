@@ -124,7 +124,7 @@ import { createComboProtocolLanes, dispatchNativeComboChild } from "./core-combo
 import { createJevModelInvoker } from "./jev-model-invoke";
 import { comboRequestedEffortLabel } from "./combo-requested-effort";
 import { clientWireOf } from "../inference/client-wire";
-import { resolveContextPrincipal } from "../auth-cors";
+import { resolveContextPrincipal, resolveDurableSessionPrincipal } from "../auth-cors";
 
 /**
  * Sends one combo target may run on its own before the ladder moves on. A target is a whole
@@ -396,6 +396,8 @@ export async function executeComboResponses(
   // result after its provisional Authorization is removed, including an explicitly keyless result.
   const replayPrincipal = options.replayPrincipal
     ?? { clientPrincipalId: resolveContextPrincipal(req, config, options.admission) };
+  const durableClientPrincipalId = "durableClientPrincipalId" in options
+    ? options.durableClientPrincipalId : resolveDurableSessionPrincipal(req, config, options.admission);
   // The caller's model scope, resolved once from the request options. A capability-authenticated
   // internal request carries the caller's captured scope on options.admissionScope even though
   // its own admission is the host's broad key; recomputing from options.admission would lose it.
@@ -1156,6 +1158,7 @@ export async function executeComboResponses(
       }) : await requestDispatchers.handleResponses(childRequest, config, childLog, {
         ...options,
         replayPrincipal,
+        durableClientPrincipalId,
         // A bridge child is a concrete route; the native source belongs to this loop only.
         ...(options.protocolSource ? { protocolSource: undefined } : {}),
         // After the spread: the child must run on THIS target's ladder, not on the holder the

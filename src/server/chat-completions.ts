@@ -79,7 +79,7 @@ import {
   assertRouteAllowedByScope,
   resolveAdmissionModelScope,
 } from "./admission-model-scope";
-import { resolveContextPrincipal, type DataPlaneAdmission } from "./auth-cors";
+import { resolveContextPrincipal, resolveDurableSessionPrincipal, type DataPlaneAdmission } from "./auth-cors";
 import { tryClaimNativeMainProfileForTurn } from "../codex/native-main-admission";
 import {
   createTranslatorBudget,
@@ -554,6 +554,7 @@ async function handleChatCompletionsWithBudget(
     advisorAdmissionPolicy,
     // The bridge request carries no caller credential, so resolve the replay principal here.
     replayPrincipal: { clientPrincipalId: resolveContextPrincipal(req, config, logIds?.admission) },
+    durableClientPrincipalId: resolveDurableSessionPrincipal(req, config, admission),
     abortSignal: req.signal,
     // Body is Responses-shaped by now, but the client spoke Chat Completions.
     inboundWire: "chat",

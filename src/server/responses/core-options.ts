@@ -135,6 +135,8 @@ export interface HandleResponsesOptions {
    * which is why it refused the whole env_key flow instead of serving it.
    */
   admission?: DataPlaneAdmission;
+  /** Trusted durable owner captured before an internal request drops caller credentials. */
+  durableClientPrincipalId?: string;
   /**
    * Internal caller identity captured before Combo strips provisional credentials. An existing
    * holder with no principal preserves keyless replay; never populate it from client data.

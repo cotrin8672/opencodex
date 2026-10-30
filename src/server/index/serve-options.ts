@@ -103,6 +103,7 @@ import {
   admissionFields,
   resolveApiAuth,
   resolveResponsesApiAuth,
+  resolveDurableSessionPrincipal,
   type RequestPolicyView,
   withCors,
   withManagementCors,
@@ -626,6 +627,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
             admission,
             websocketLease,
             sessionLaneIdFromRequest(req.headers),
+            resolveDurableSessionPrincipal(req, config, admission),
           ),
         })) return undefined as unknown as Response;
         websocketLease.release();

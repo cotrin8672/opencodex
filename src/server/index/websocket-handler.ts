@@ -347,6 +347,7 @@ export function createWebsocketHandler(
             const response = await handleResponses(req, config, logCtx, {
               advisorAdmissionPolicy,
               ...(wsAdmission ? { admission: wsAdmission } : {}),
+              durableClientPrincipalId: ws.data.durableClientPrincipalId,
               forceEmptyResponseId: true,
               inboundTransport: "websocket",
               nativeControl,

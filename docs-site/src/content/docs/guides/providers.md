@@ -1455,7 +1455,7 @@ OpenCodex provides official adapter support for Qoder through the `qoder` (Globa
 
 OpenCodex can spend a Claude subscription through Anthropic's own harness instead of replaying a
 Claude Code identity against the Messages API. The `claude-cli` preset runs the official Claude Code
-CLI headlessly (`claude -p`, `stream-json`) once per turn:
+CLI headlessly, retaining a native conversation for clients that supply their own conversation ID:
 
 ```json
 {
@@ -1468,12 +1468,16 @@ CLI headlessly (`claude -p`, `stream-json`) once per turn:
 }
 ```
 
-- **Prerequisites:** `npm install -g @anthropic-ai/claude-code`, then sign in once with `claude`
-  (or `claude setup-token`). The CLI uses the machine's own Claude Code sign-in (the macOS Keychain
-  entry, or `~/.claude/.credentials.json` elsewhere).
-- **No credential stored:** this row holds no API key, and OpenCodex never reads, copies or forwards
-  a Claude token. The CLI owns the login and bills the account itself. A CLI that is not signed in
-  fails the turn with a sign-in error naming the command, instead of a generic `401`.
+- **Prerequisites:** install the official native Claude Code executable, then sign in once with
+  `claude` (or `claude setup-token`). Persistent sessions require a native binary (`claude.exe` on
+  Windows); a `.cmd` or `.bat` launcher is refused with `cli_native_binary_required`. The CLI is
+  found on `PATH`, with the native install location (`~/.local/bin/claude`, or `claude.exe` on
+  Windows) as a fallback. It uses the machine's own Claude Code sign-in (the macOS Keychain entry,
+  or `~/.claude/.credentials.json` elsewhere).
+- **No credential stored:** this row holds no API key. The CLI owns the login and bills the account
+  itself; OpenCodex's subscription check reads the sign-in in memory without importing it into the
+  credential store. A CLI that is not signed in fails the turn with a sign-in error naming the
+  command, instead of a generic `401`.
   Classification follows the same fact: the preset is a keyless key row (`keyOptional`), so it needs
   no API key and no key field is offered for it. An API key saved on this row by other means is never
   handed to the harness — key billing belongs to the `anthropic-apikey` preset.
@@ -1487,34 +1491,48 @@ CLI headlessly (`claude -p`, `stream-json`) once per turn:
   dashboard lists it as ready without a key and never prompts for one.
 - **One sign-in serves the whole proxy:** the harness reads the Claude Code sign-in of the user
   OpenCodex runs as, so every request routed through this row — from any client of the proxy —
-  spends that one Claude account. There is no per-client account, no pooling and no multiplexing;
+  spends that one Claude account. There is no per-client sign-in or account pooling;
   giving several people their own Claude usage needs one proxy user per sign-in.
-- **Input media:** the row publishes its models as text-only for v1. The CLI accepts an image frame
+- **Input media:** the row publishes its models as text-only. The CLI accepts an image frame
   on its stream-json input, but no headless turn has been shown to hand those bytes to the model, so
   an image sent straight to this provider is refused (`unsupported_input_modality`) instead of
   being silently dropped and answered blind. With the
   vision sidecar on the request path, images are captioned into text before they reach the row.
-- **Isolation:** every turn runs in a scoped child environment with no inherited `ANTHROPIC_*`
+- **Isolation:** each worker runs in a scoped child environment with no inherited `ANTHROPIC_*`
   variable (a `claude` already pointed at this proxy therefore cannot loop back into it), telemetry,
-  feedback and the auto-updater disabled, and `--tools ""`, `--strict-mcp-config` plus
-  `--setting-sources ""`. The harness loads no CLAUDE.md, skill, hook, plugin or MCP server from the
-  machine and can neither read, write, exec nor browse. No session is persisted between turns. The
-  official CLI is found on `PATH`, or at the native install location (`~/.local/bin/claude`) when
-  a service starts OpenCodex with an older `PATH`.
+  feedback and the auto-updater disabled. Built-in tools and setting sources are disabled, and strict
+  MCP isolation admits only the client's selected tools. The harness loads no CLAUDE.md, skill,
+  hook, plugin or other MCP server from the machine; file access, shell commands and browsing
+  remain external client actions.
 - **System prompt:** the caller's system and developer prompts replace the Claude Code preset
-  (`--system-prompt-file`), so the turn answers the client's contract rather than the harness
-  persona. The folded prompt is staged in a private per-turn file (mode `0600`) and passed by path,
-  because process arguments are world-readable through process listing; a request that carries
-  neither a system nor a developer prompt gets only the fixed conversation-replay instructions.
-- **Conversation caching:** each message is replayed as a separate stable text block, with the
-  current message formatted identically to its later history representation. Long history is cut
-  only at whole-message checkpoints. Tool catalogs serialize deterministically. Claude Code
-  controls cache breakpoints, so this makes prompt-cache reuse possible without guaranteeing it.
-- **Tool ownership:** when the request carries tools, an isolated capture-only MCP catalog exposes
-  only the client's selected tools (the same bridge CodeBuddy uses). The CLI captures the call and
-  the turn ends there; approval, sandboxing, execution and the returned result stay with Codex,
-  Pi, or another client. Built-in tools and every other MCP server remain disabled.
-- **Subscription limits:** before each launch OpenCodex asks Anthropic's usage endpoint, with the
+  through stdin in persistent mode, keeping prompt text out of process arguments. One-shot
+  compatibility stages the folded prompt in a private per-turn file (mode `0600`) and passes only
+  its path. Fixed replay and tool-ownership instructions accompany the caller's prompt.
+- **Conversation continuity:** an explicit own `thread-id`, `session_id`, or `session-id` selects
+  a persistent worker. Reuse the same identity and client history for that conversation; parent
+  thread IDs and prompt-cache keys do not select or share one. Without an own identity, requests
+  retain isolated one-shot compatibility. A cold start or history rebase uses the full stable text
+  projection, trimmed only at message boundaries; later user turns use Claude's native context.
+  Claude Code controls prompt-cache breakpoints, so cache savings are not guaranteed.
+- **Tool ownership:** Codex, Pi, or another external client owns approval, sandboxing and execution.
+  In persistent mode the isolated MCP call waits for that client's real result, then Claude
+  continues in the same worker. Return every result under its original call ID and preserve its
+  content and error flag. One-shot compatibility ends the CLI after capturing a tool batch and
+  replays the client's results in the next request.
+- **Disconnects and retries:** in persistent mode, the same active input can reconnect for 30 seconds
+  after an HTTP disconnect. Idle workers stop after 30 minutes, with at most 16 live workers.
+  Completed text responses can replay from the private receipt journal without new model usage. After a proxy
+  restart, return the original tool results in client history so a fresh worker can continue;
+  native SDK session resume is not guaranteed.
+- **Uncertain tool delivery:** in persistent mode, receipts and a delivery marker are committed to
+  the private SQLite journal before calls reach the client. A batch captured while disconnected
+  can be delivered once if delivery never started. A retry after delivery started receives HTTP 409
+  `claude_tool_delivery_uncertain` instead of another tool batch. Missing results produce
+  `claude_tool_results_pending` (a 400/409 client error), and changed recorded results produce
+  `claude_tool_result_conflict`. Verify whether the action ran and return its existing results;
+  do not automatically execute it again. External actions have no global exactly-once guarantee.
+  The journal under the OpenCodex home contains private tool arguments and outputs.
+- **Subscription limits:** before each request OpenCodex asks Anthropic's usage endpoint, with the
   CLI's own sign-in read in memory, whether the plan's 5-hour, weekly or model-specific window is
   full. An exhausted plan is refused locally with HTTP 429 `claude_subscription_cooldown` and a
   `Retry-After` for the reset, instead of starting a CLI that would fail. The answer is cached for

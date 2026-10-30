@@ -34,6 +34,8 @@ export interface WsData {
    * attribution.
    */
   admission?: DataPlaneAdmission;
+  /** Captured from the original upgrade request before credential headers are filtered. */
+  durableClientPrincipalId?: string;
   authContext?: CodexAuthContext; // last resolved account decision for observability/registry cleanup
   cancel?: () => void; // cancels the in-flight stream reader/fetch
   turnId?: number; // monotonically increasing per socket; prevents stale frames after replacement turns
@@ -103,6 +105,7 @@ export function buildResponsesWsData(
   admission: DataPlaneAdmission,
   admissionLease?: AdmissionReservation<ServerWebSocket<WsData>>,
   sessionLaneId?: string,
+  durableClientPrincipalId?: string,
 ): WsData {
   // Auth is handshake-time only on this path: the per-frame contexts have no
   // request headers left to re-resolve from, so the decision rides along here.
@@ -111,6 +114,7 @@ export function buildResponsesWsData(
     admission,
     ...(admissionLease ? { admissionLease } : {}),
     ...(sessionLaneId ? { sessionLaneId } : {}),
+    ...(durableClientPrincipalId ? { durableClientPrincipalId } : {}),
   };
 }
 

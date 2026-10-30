@@ -57,7 +57,7 @@ import {
 } from "../../oauth/generic-account-failover";
 import { admitGenericSessionAccount, bindGenericSessionAccount, genericSessionAccount, genericSessionAccountEligible, genericSessionAffinityEnabled, preferredGenericSessionAccount } from "../../oauth/generic-session-affinity";
 import { oauthSessionKeyFromParts } from "../../oauth/session-affinity-key";
-import { resolveContextPrincipal } from "../auth-cors";
+import { resolveContextPrincipal, resolveDurableSessionPrincipal } from "../auth-cors";
 import { tryKiroAlternateAfterTerminalRefresh } from "../../oauth/kiro-terminal-failover";
 import { classifyModelFamilyForQuota } from "../../oauth/account-quota-rank";
 import { expandInferenceOAuthSendBudget } from "../inference/context";
@@ -135,6 +135,8 @@ export async function prepareResponsesTransport(
   >,
 ) {
   const { config, logCtx, options, req } = requestContext;
+  const durableClientPrincipalId = "durableClientPrincipalId" in options
+    ? options.durableClientPrincipalId : resolveDurableSessionPrincipal(req, config, options.admission);
   const { route, parsed, inboundWire, translatorBudget } = requestState;
   const genericAffinityMode = genericSessionAffinityEnabled(config, route.providerName);
   const anthropicInstance = route.provider.authMode === "oauth"
@@ -694,7 +696,7 @@ export async function prepareResponsesTransport(
       const runTurn = resolved.runTurn.bind(resolved);
       rawRunTurns.set(resolved, (requestParsed, incoming, emit) => {
         const response = {};
-        return runTurn(requestParsed, incoming, event => { observeEvent(event, response); emit(event); });
+        return runTurn(requestParsed, { ...incoming, durableClientPrincipalId }, event => { observeEvent(event, response); emit(event); });
       });
       resolved.runTurn = (requestParsed, incoming, emit) => runSelectedTurn(resolved, requestParsed, incoming, emit);
     }
