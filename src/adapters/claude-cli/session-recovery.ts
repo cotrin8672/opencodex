@@ -20,10 +20,17 @@ export function prepareClaudeToolResults(snapshot: ClaudeSessionSnapshot, messag
   };
   const sameResult = (left: ReturnType<typeof claudeResult>, right: ReturnType<typeof claudeResult>): boolean =>
     left.hash === right.hash && left.content === right.content && left.isError === right.isError;
+  const completedResults = new Map(snapshot.turns.filter(turn => turn.phase === "completed")
+    .flatMap(turn => turn.calls.flatMap(call => call.result ? [[call.id, call.result] as const] : [])));
 
   for (const [index, message] of messages.entries()) {
     if (message.role === "toolResult") {
-      const result = claudeResult(message);
+      // Completed receipts prove acknowledgement; later client history may shorten or synthesize their outputs.
+      const result = completedResults.get(message.toolCallId) ?? claudeResult(message);
+      if (completedResults.has(message.toolCallId) && !sameResult(result, claudeResult(message))) {
+        message.content = result.content;
+        message.isError = result.isError;
+      }
       const previous = results.get(message.toolCallId);
       if (previous && !sameResult(previous, result)) conflict();
       results.set(message.toolCallId, result);
@@ -44,9 +51,8 @@ export function prepareClaudeToolResults(snapshot: ClaudeSessionSnapshot, messag
   for (const turn of snapshot.turns) for (const call of turn.calls) {
     const matches = origins.get(call.id) ?? [];
     // A running/interrupted receipt can contain an unfinished argument buffer.
-    let signature: string | undefined;
     if (matches.length || (turn.phase === "tools" && call.result)) {
-      signature = claudeDigest([call.name, JSON.parse(call.arguments)]);
+      const signature = claudeDigest([call.name, JSON.parse(call.arguments)]);
       for (const origin of matches) {
         if (claudeDigest([namespacedToolName(origin.call.namespace, origin.call.name), origin.call.arguments ?? {}]) !== signature) {
           throw new ClaudeSessionError("Historical tool identity disagrees with its recorded call ID.", "claude_tool_id_conflict");
@@ -64,7 +70,7 @@ export function prepareClaudeToolResults(snapshot: ClaudeSessionSnapshot, messag
     }
     const restoreCompleted = turn.phase === "completed" && !result && matches.length > 0;
     if ((turn.phase !== "tools" && !restoreCompleted) || !call.result) continue;
-    recoveredCalls.add(signature ?? claudeDigest([call.name, JSON.parse(call.arguments)]));
+    recoveredCalls.add(call.id);
     if (result) continue;
     const origin = matches[0];
     if (matches.length !== 1 || !origin) {

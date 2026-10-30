@@ -91,7 +91,7 @@ describe.skipIf(!nativeBinary)("Claude sessions through SDK 0.3.314 and local na
     } finally { held.release(); await h.close(); }
   }, 45_000);
 
-  test.each([false, true])("newer input stops the active worker and bootstraps full history (disconnected=%s)", async disconnected => {
+  test.each([false, true])("newer input interrupts the active turn while preserving native history (disconnected=%s)", async disconnected => {
     const held = gate();
     const h = nativeSession([
       { content: [text("earlier answer")] },
@@ -113,8 +113,9 @@ describe.skipIf(!nativeBinary)("Claude sessions through SDK 0.3.314 and local na
       await replacement.done;
       await old.done;
       final(replacement.events, "replacement answer");
-      await nativeUntil(() => h.children[0]!.exitCode !== null || h.children[0]!.signalCode !== null, "superseded native child exits");
-      expect(h.children).toHaveLength(2);
+      expect(h.children[0]!.exitCode).toBeNull();
+      expect(h.children[0]!.signalCode).toBeNull();
+      expect(h.children).toHaveLength(1);
       expect(h.requests).toHaveLength(3);
       const bootstrap = JSON.stringify(h.requests[2]!.messages);
       for (const item of ["read both files", "earlier answer", "old slow instruction", "new urgent instruction"]) expect(bootstrap).toContain(item);

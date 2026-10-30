@@ -56,12 +56,12 @@ test("identical raw-history reconnect keeps the restored generation and its dupl
   expect(h.workers).toHaveLength(1);
   expect(recovered.worker.stops).toBe(0);
   expect(recovered.worker.sends).toHaveLength(1);
-  const repeated = { ...action, id: "fresh_repeated_id" };
+  const repeated = { ...action };
   recovered.worker.mcp(repeated);
   await recovered.worker.blocks([repeated]);
   await reconnect.done;
   expect(reconnect.events.some(event => event.type === "tool_call_start")).toBe(false);
-  expect(reconnect.events.at(-1)).toMatchObject({ type: "error", code: "claude_recovery_repeat_refused" });
+  expect(reconnect.events.at(-1)).toMatchObject({ type: "error", code: "claude_tool_id_conflict" });
 });
 
 test("completed restored responses replay for the raw request both before and after restart", async () => {
@@ -92,12 +92,12 @@ test("a crashed restored continuation retains omitted output and duplicate prote
   expect(journal.load(input.scope)!.turns[0]!.phase).toBe("completed");
   const retried = await h.start(rebased);
   expect(retried.worker.sends[0]).toContain("UNIQUE_COMMITTED_RECOVERY_OUTPUT");
-  const repeated = { ...action, id: "fresh_id_after_crash" };
+  const repeated = { ...action };
   retried.worker.mcp(repeated);
   await retried.worker.blocks([repeated]);
   await retried.done;
   expect(retried.events.some(event => event.type === "tool_call_start")).toBe(false);
-  expect(retried.events.at(-1)).toMatchObject({ type: "error", code: "claude_recovery_repeat_refused" });
+  expect(retried.events.at(-1)).toMatchObject({ type: "error", code: "claude_tool_id_conflict" });
 });
 
 test("a failed retention write preserves live receipts, call references and pending entries until commit", () => {

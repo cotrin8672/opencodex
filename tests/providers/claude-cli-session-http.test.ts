@@ -78,7 +78,7 @@ async function withHttp(run: (http: {
       };
       return adapter;
     };
-    const config = { port: 0, defaultProvider: "claude-cli", providers: { "claude-cli": {
+    const config = { port: 0, defaultProvider: "claude-cli", emptyCompletionRetry: true, providers: { "claude-cli": {
       adapter: "claude-cli", baseUrl: "https://api.anthropic.com", authMode: "key", selectedModels: ["claude-sonnet-5-5"],
     } } } as OcxConfig;
     server = Bun.serve({ hostname: "127.0.0.1", port: 0,
@@ -170,6 +170,55 @@ test("scoped HTTP Responses reuses the worker for client results and refuses dup
     expect(clientExecutions).toBe(1);
   });
 }, 20_000);
+
+test("HTTP follow-up survives a cancelled consumer, missing replay text, and reshaped historical results", async () => {
+  await withHttp(async ({ h, post }) => {
+    const prompt = "Read fixture.txt once.";
+    const initial = post({ input: [{ role: "user", content: prompt }] });
+    await until(() => !!h.workers[0]?.sends.length);
+    const worker = h.workers[0]!;
+    const firstBody = collect(await bounded(initial));
+    const action = { id: "toolu_http_queued", name: worker.options.tools[0]!.name, arguments: { path: "fixture.txt" } };
+    const pending = worker.mcp(action);
+    await worker.blocks([action]);
+    const first = completed(await firstBody);
+    const instruction = "Keep the queued instruction when the tool returns.";
+    const abort = new AbortController();
+    const queuedResponse = await bounded(post({ input: [
+      { role: "user", content: prompt }, ...first.output, { role: "user", content: instruction },
+    ] }, abort.signal));
+    const queuedBody = collect(queuedResponse);
+    void queuedBody.catch(() => {});
+    await until(() => [...h.journal.records.values()].some(snapshot => snapshot.instructions?.some(entry => entry.phase === "queued")));
+    expect(worker.sends).toHaveLength(1);
+    abort.abort();
+    await queuedBody.catch(() => undefined);
+    const continuation = post({ previous_response_id: first.id, input: [{
+      type: "function_call_output", call_id: action.id, output: "AUTHORITATIVE_FULL_OUTPUT",
+    }] });
+    expect((await bounded(pending)).content[0]!.text).toBe("AUTHORITATIVE_FULL_OUTPUT");
+    expect(worker.sends[1]).toBe(instruction);
+    expect(worker.sendOptions[1]).toMatchObject({ shouldQuery: false });
+    await worker.finish("Queued instruction applied.");
+    const resumed = completed(await collect(await bounded(continuation)));
+    expect(JSON.stringify(resumed.output)).toContain("Queued instruction applied.");
+    const nextRequest = post({ previous_response_id: resumed.id, input: [{ role: "user", content: "next question" }] });
+    await until(() => worker.sends.length === 3 || h.workers.length > 1);
+    expect(h.workers).toHaveLength(1);
+    expect(worker.sends[2]).toBe("next question");
+    const nextBody = collect(await bounded(nextRequest));
+    const stale = await collect(await bounded(post({ input: [
+      { role: "user", content: prompt }, ...first.output,
+      { type: "function_call_output", call_id: action.id, output: "[shortened historical output]" },
+    ] })));
+    expect(JSON.stringify(completed(stale).output)).toContain("Queued instruction applied.");
+    expect(worker.stops).toBe(0);
+    await worker.finish("next answer");
+    expect(JSON.stringify(completed(await nextBody).output)).toContain("next answer");
+    expect(h.workers).toHaveLength(1);
+    expect(worker.interrupts).toBe(0);
+  });
+}, 15_000);
 
 test("cancelling open HTTP SSE before tools reattaches the same inference and delivers each call once", async () => {
   await withHttp(async ({ h, post, signals }) => {

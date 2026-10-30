@@ -2,7 +2,7 @@ import type { AdapterEvent, OcxMessage, OcxParsedRequest, OcxProviderConfig } fr
 import type { IncomingMeta } from "../base";
 import type { CodeBuddyToolBridge } from "../codebuddy/tool-bridge";
 import { CODEBUDDY_MCP_TOOL_PREFIX, CODEBUDDY_TOOL_LIMITS } from "../codebuddy/tool-bridge";
-import { CodingAgentProtocolError, mapStreamMessageToEvents, releaseOpenToolBlocks, type StreamParseState } from "../coding-agent/protocol";
+import { CodingAgentProtocolError, mapStreamMessageToEvents, releaseOpenToolBlocks, usageFromResult, type StreamParseState } from "../coding-agent/protocol";
 import { SendBudgetExhaustedError } from "../../lib/upstream-retry";
 import { getConfigDir } from "../../config/paths";
 import { createTranslatorBudget, isTranslatorBudgetExceededError } from "../../lib/translator-budget";
@@ -10,6 +10,7 @@ import { registerOptionalShutdownHook, didRunOptionalShutdownHooks } from "../..
 import { buildClaudeSessionBootstrap, claudeAccountIdentity, claudeDigest, claudeHistory, claudeOperationIdentity, claudeToolResultContinuation, claudeUserText, historyExtends } from "./session-context";
 import { openClaudeSessionJournal, type ClaudeSessionJournal, type ClaudeSessionSnapshot, type ClaudeToolReceipt, type ClaudeTurnReceipt } from "./session-journal";
 import { prepareClaudeToolResults } from "./session-recovery";
+import { extractClaudeInstructions, restoreClaudeInstructions } from "./session-instructions";
 import { ClaudeSessionError } from "./session-errors";
 import type { ClaudeSessionWorker, ClaudeWorkerOptions, ClaudeWorkerToolCall } from "./session-worker";
 
@@ -52,9 +53,12 @@ type Leg = {
   openCall?: ClaudeToolReceipt;
   nativeNames: Map<string, string>;
   mcpIds: Set<string>;
-  recoveredCalls: Set<string>;
   buffered: boolean;
   waitingTools?: boolean;
+  waitingResults?: boolean;
+  interrupting?: boolean;
+  nativeId: string;
+  instructionIds: string[];
   finished: boolean;
   bytes: number;
   done: Promise<void>;
@@ -76,6 +80,7 @@ type Session = {
   setup: Promise<void>;
   epoch: number;
   queued: QueuedTool[];
+  nativeId?: string;
 };
 
 /** One owner per conversation; a disconnected HTTP response does not own the Claude process. */
@@ -124,13 +129,12 @@ export class ClaudeSessionManager {
       const fingerprint = (): string => claudeDigest([history, configuration, catalog, input.parsed.options, operationId]);
       let inputHash = fingerprint();
       const requestHash = inputHash;
+      const rawPrevious = this.receipt(session, requestHash);
+      if ((session.active?.finished || rawPrevious !== session.active?.receipt) && this.replay(session, rawPrevious, operationId, emit)) return;
       if (session.active && !session.active.finished
-        && (session.active.receipt.inputHash === inputHash || session.active.receipt.requestHash === requestHash)) {
+        && this.matches(session.active.receipt, requestHash)) {
         leg = session.active;
       } else {
-        if (session.active && !session.active.finished) {
-          this.fail(session, new ClaudeSessionError("A newer input replaced this Claude generation.", "claude_turn_superseded", 499));
-        }
         // Never-delivered actions can be discarded; delivered actions still require their actual results.
         const obsolete = session.snapshot.turns.filter(turn => turn.phase === "tools" && !turn.deliveryStarted
           && turn.inputHash !== inputHash && turn.requestHash !== requestHash);
@@ -144,9 +148,13 @@ export class ClaudeSessionManager {
         }
         const staged = prepareClaudeToolResults(session.snapshot, input.parsed.context.messages);
         if (staged.changed) this.save(session, staged.snapshot);
-        else session.snapshot = staged.snapshot;
-        input = { ...input, parsed: { ...input.parsed, context: { ...input.parsed.context, messages: staged.messages } } };
-        history = claudeHistory(staged.messages);
+        else {
+          session.snapshot = staged.snapshot;
+          if (session.active) session.active.receipt = staged.snapshot.turns.find(turn => turn.inputHash === session.active!.receipt.inputHash) ?? session.active.receipt;
+        }
+        const restored = restoreClaudeInstructions(staged.messages, session.snapshot.instructions ?? []);
+        input = { ...input, parsed: { ...input.parsed, context: { ...input.parsed.context, messages: restored } } };
+        history = claudeHistory(restored);
         inputHash = fingerprint();
         const historyHash = claudeDigest(history);
         if (session.snapshot.turns.some(turn => turn.historyHash === historyHash && turn.inputHash !== inputHash
@@ -154,78 +162,123 @@ export class ClaudeSessionManager {
             || turn.calls.some(call => !call.result)))) {
           throw new ClaudeSessionError("This input already delivered an external action. Return its existing result before changing settings.", "claude_tool_delivery_uncertain");
         }
-        const previous = session.snapshot.turns.find(turn => turn.inputHash === inputHash || turn.requestHash === requestHash);
-        if (previous?.phase === "expired" && operationId) throw new ClaudeSessionError("This old response is no longer cached; it will not be executed again.", "claude_replay_expired");
-        if (previous?.phase === "tools" || (previous?.phase === "completed" && operationId)) {
-          session.consumer?.cancel();
-          this.deliverReceipt(session, previous, emit);
-          return;
-        }
-        const pendingTurns = staged.pendingTurns;
-        if (pendingTurns.some(turn => turn.calls.some(call => !call.result))) {
-          throw new ClaudeSessionError("Claude is waiting for the existing tool results. An uncertain tool action will not be issued again.", "claude_tool_results_pending");
-        }
-        const last = input.parsed.context.messages.at(-1);
-        const extendsHistory = historyExtends(history, session.snapshot.history);
-        const nativeContinuation = session.worker && session.configuration === configuration && extendsHistory
-          && (!session.queued.length || session.catalog === catalog)
-          && (pendingTurns.length > 0
-            ? claudeToolResultContinuation(staged.messages, session.snapshot.history, new Set(pendingTurns.flatMap(turn => turn.calls.map(call => call.id))))
-              && pendingTurns.every(turn => turn.calls.every(call => session.pending.has(call.id)))
-            : history.length === session.snapshot.history.length + 1 && last?.role === "user");
-        if (!nativeContinuation) this.stopWorker(session);
-        if (session.snapshot.turns.length >= 4096 && !previous) throw new ClaudeSessionError("This conversation reached its receipt limit; start a new conversation.", "claude_session_history_limit", 413);
-        if (previous) session.snapshot.turns.splice(session.snapshot.turns.indexOf(previous), 1);
-        leg = this.newLeg(session, input, inputHash, historyHash, operationId, requestHash);
-        if (!nativeContinuation) leg.recoveredCalls = staged.recoveredCalls;
-        leg.waitingTools = !!nativeContinuation && pendingTurns.length > 0 && session.queued.length > 0;
-        session.snapshot.history = history;
-        this.save(session);
-        if (!session.worker) {
-          const createWorker = this.deps.createWorker ?? (await import("./session-worker")).createClaudeSessionWorker;
-          const owner = session;
-          const epoch = session.epoch;
-          const worker = await createWorker({
-            binary: input.binary, model: input.parsed.modelId, env: input.env, systemPrompt: input.systemPrompt,
-            effort: input.effort, tools: input.bridge.tools,
-            onMessage: message => { if (owner.epoch === epoch) this.onMessage(owner, message); },
-            onToolCall: (call, signal) => owner.epoch === epoch ? this.onToolCall(owner, call, signal)
-              : Promise.reject(new ClaudeSessionError("The Claude worker was replaced.", "claude_turn_superseded", 499)),
-            onError: error => { if (owner.epoch === epoch) this.fail(owner, error); },
+        const previous = this.receipt(session, inputHash) ?? this.receipt(session, requestHash);
+        if ((session.active?.finished || previous !== session.active?.receipt) && this.replay(session, previous, operationId, emit)) return;
+        if (session.active && !session.active.finished && this.matches(session.active.receipt, inputHash)) {
+          leg = session.active;
+        } else {
+          let pendingTurns = session.snapshot.turns.filter(turn => turn.phase === "tools");
+          const missingResults = pendingTurns.some(turn => turn.calls.some(call => !call.result));
+          const current = session.active;
+          const extending = extractClaudeInstructions(restored, session.snapshot.history);
+          const queued = (session.snapshot.instructions ?? []).filter(entry => entry.phase === "queued");
+          const queuedTexts = queued.flatMap(entry => entry.texts);
+          const newTexts = (extending ?? []).filter(text => {
+            if (queuedTexts[0] !== text) return true;
+            queuedTexts.shift(); return false;
           });
-          if (leg.finished || this.closed) worker.stop();
-          else {
-            session.worker = worker;
-            session.configuration = configuration;
-            session.catalog = catalog;
+          if (newTexts.length && (current && !current.finished || pendingTurns.length)) {
+            this.enqueueInstructions(session, requestHash, operationId, newTexts);
+            pendingTurns = session.snapshot.turns.filter(turn => turn.phase === "tools");
           }
-        } else if (session.catalog !== catalog) {
-          await session.worker.updateTools(input.bridge.tools);
-          session.catalog = catalog;
-        }
-        if (input.incoming.abortSignal?.aborted) {
-          this.fail(session, new ClaudeSessionError("The request was cancelled before inference.", "claude_request_cancelled", 499));
-          return;
-        }
-        if (!leg.finished) {
-          if (!session.worker) throw new ClaudeSessionError("The Claude worker did not start.", "claude_worker_unavailable", 502);
-          if (!leg.waitingTools) this.admit(leg);
-          for (const turn of pendingTurns) turn.phase = "completed";
-          try { this.save(session, session.snapshot, pendingTurns); }
-          catch (error) { for (const turn of pendingTurns) turn.phase = "tools"; throw error; }
-          if (nativeContinuation && pendingTurns.length) {
-            for (const turn of pendingTurns) for (const call of turn.calls) {
-              const pending = session.pending.get(call.id);
-              if (!pending || !call.result) throw new ClaudeSessionError("The pending MCP call was lost before continuation.", "claude_mcp_call_lost", 502);
-              pending.resolve({ content: [{ type: "text", text: call.result.content }], isError: call.result.isError });
-            }
-            this.finishTools(session);
+          const accepted = (session.snapshot.instructions ?? []).filter(entry => entry.phase !== "completed");
+          const sameWorker = session.worker && session.configuration === configuration && session.catalog === catalog;
+          let steered = false;
+          if (current && !current.finished && !current.waitingResults) {
+            if (sameWorker && extending) {
+              await this.interruptGeneration(session);
+              steered = true;
+            } else this.fail(session, new ClaudeSessionError("A newer input replaced this Claude generation.", "claude_turn_superseded", 499));
+          } else if (current?.waitingResults && !current.finished) {
+            this.finishInterrupted(session);
+          }
+          if (missingResults) {
+            if (!accepted.length && newTexts.length === 0) throw new ClaudeSessionError("Claude is waiting for the existing tool results.", "claude_tool_results_pending");
+            if (previous) session.snapshot.turns.splice(session.snapshot.turns.indexOf(previous), 1);
+            leg = this.newLeg(session, input, inputHash, historyHash, operationId, requestHash);
+            leg.waitingResults = true;
+            leg.nativeId = session.nativeId ?? leg.nativeId;
+            if (leg.timer) clearTimeout(leg.timer);
+            leg.receipt.requestHashes = [...new Set([requestHash, ...accepted.map(entry => entry.inputHash)])].slice(-64);
+            leg.instructionIds = accepted.map(entry => entry.inputHash);
+            leg.receipt.events.push({ type: "heartbeat", replayUnsafe: true });
+            this.save(session);
           } else {
-            const text = nativeContinuation && last ? claudeUserText(last) : buildClaudeSessionBootstrap(input.parsed, input.provider, input.bridge);
-            session.worker.send(text);
+            const last = input.parsed.context.messages.at(-1);
+            const extendsHistory = historyExtends(history, session.snapshot.history);
+            const nativeContinuation = session.worker && session.configuration === configuration && (extendsHistory || steered)
+              && (!session.queued.length || session.catalog === catalog)
+              && (pendingTurns.length > 0
+                ? (claudeToolResultContinuation(restored, session.snapshot.history, new Set(pendingTurns.flatMap(turn => turn.calls.map(call => call.id)))) || extending)
+                  && pendingTurns.every(turn => turn.calls.every(call => session.pending.has(call.id)))
+                : steered || history.length === session.snapshot.history.length + 1 && last?.role === "user");
+            if (!nativeContinuation) this.stopWorker(session);
+            if (session.snapshot.turns.length >= 4096 && !previous) throw new ClaudeSessionError("This conversation reached its receipt limit; start a new conversation.", "claude_session_history_limit", 413);
+            if (previous) session.snapshot.turns.splice(session.snapshot.turns.indexOf(previous), 1);
+            leg = this.newLeg(session, input, inputHash, historyHash, operationId, requestHash);
+            leg.receipt.requestHashes = [...new Set([requestHash, ...accepted.map(entry => entry.inputHash)])].slice(-64);
+            leg.instructionIds = accepted.map(entry => entry.inputHash);
+            if (nativeContinuation && pendingTurns.length) leg.nativeId = session.nativeId ?? leg.nativeId;
+            leg.waitingTools = !!nativeContinuation && pendingTurns.length > 0 && session.queued.length > 0;
+            session.snapshot.history = history;
+            this.save(session);
+            if (!session.worker) {
+              const createWorker = this.deps.createWorker ?? (await import("./session-worker")).createClaudeSessionWorker;
+              const owner = session;
+              const epoch = session.epoch;
+              const worker = await createWorker({
+                binary: input.binary, model: input.parsed.modelId, env: input.env, systemPrompt: input.systemPrompt,
+                effort: input.effort, tools: input.bridge.tools,
+                onMessage: message => { if (owner.epoch === epoch) this.onMessage(owner, message); },
+                onToolCall: (call, signal) => owner.epoch === epoch ? this.onToolCall(owner, call, signal)
+                  : Promise.reject(new ClaudeSessionError("The Claude worker was replaced.", "claude_turn_superseded", 499)),
+                onError: error => { if (owner.epoch === epoch) this.fail(owner, error); },
+              });
+              if (leg.finished || this.closed) worker.stop();
+              else {
+                session.worker = worker;
+                session.configuration = configuration;
+                session.catalog = catalog;
+              }
+            } else if (session.catalog !== catalog) {
+              await session.worker.updateTools(input.bridge.tools);
+              session.catalog = catalog;
+            }
+            if (input.incoming.abortSignal?.aborted) {
+              this.fail(session, new ClaudeSessionError("The request was cancelled before inference.", "claude_request_cancelled", 499));
+              return;
+            }
+            if (!leg.finished) {
+              if (!session.worker) throw new ClaudeSessionError("The Claude worker did not start.", "claude_worker_unavailable", 502);
+              if (!leg.waitingTools) this.admit(leg);
+              if (nativeContinuation && pendingTurns.length) {
+                for (const instruction of accepted.filter(entry => entry.phase === "queued")) {
+                  for (const text of instruction.texts) await session.worker.send(text, { shouldQuery: false, uuid: crypto.randomUUID() });
+                }
+              }
+              for (const instruction of accepted) instruction.phase = "sent";
+              for (const turn of pendingTurns) turn.phase = "completed";
+              try { this.save(session, session.snapshot, pendingTurns); }
+              catch (error) { for (const turn of pendingTurns) turn.phase = "tools"; throw error; }
+              if (nativeContinuation && pendingTurns.length) {
+                for (const turn of pendingTurns) for (const call of turn.calls) {
+                  const pending = session.pending.get(call.id);
+                  if (!pending || !call.result) throw new ClaudeSessionError("The pending MCP call was lost before continuation.", "claude_mcp_call_lost", 502);
+                  pending.resolve({ content: [{ type: "text", text: call.result.content }], isError: call.result.isError });
+                }
+                this.finishTools(session);
+              } else {
+                const text = nativeContinuation && last
+                  ? (steered && newTexts.length ? newTexts.join("\n\n") : claudeUserText(last))
+                  : buildClaudeSessionBootstrap(input.parsed, input.provider, input.bridge);
+                session.nativeId = leg.nativeId;
+                await session.worker.send(text, { uuid: leg.nativeId });
+              }
+            }
           }
         }
       }
+      if (leg.waitingResults) input.incoming.pacingSlot?.release();
       session.consumer?.cancel();
       let abort!: () => void;
       cancelled = new Promise<void>(resolve => { abort = resolve; });
@@ -253,6 +306,81 @@ export class ClaudeSessionManager {
     }
   }
 
+  private matches(receipt: ClaudeTurnReceipt, hash: string): boolean {
+    return receipt.inputHash === hash || receipt.requestHash === hash || receipt.requestHashes?.includes(hash) === true;
+  }
+
+  private receipt(session: Session, hash: string): ClaudeTurnReceipt | undefined {
+    return session.snapshot.turns.findLast(receipt => this.matches(receipt, hash));
+  }
+
+  private replay(session: Session, receipt: ClaudeTurnReceipt | undefined, operationId: string | undefined, emit: Consumer["emit"]): boolean {
+    if (receipt?.phase === "expired" && operationId) throw new ClaudeSessionError("This old response is no longer cached; it will not be executed again.", "claude_replay_expired");
+    if (receipt?.phase === "tools" || (receipt?.phase === "completed" && operationId)
+      || receipt?.events.some(event => event.type === "incomplete" && event.reason === "superseded")) {
+      this.deliverReceipt(session, receipt!, emit); return true;
+    }
+    return false;
+  }
+
+  private enqueueInstructions(session: Session, inputHash: string, operationId: string | undefined, texts: string[]): void {
+    if (session.snapshot.instructions?.some(entry => entry.inputHash === inputHash)) return;
+    if ((session.snapshot.instructions ?? []).filter(entry => entry.phase !== "completed").length >= 64) {
+      throw new ClaudeSessionError("The Claude instruction queue is full; return the pending tool results before adding more input.", "claude_instruction_queue_full", 429, true);
+    }
+    const draft = structuredClone(session.snapshot);
+    // Interrupted assistant fragments may disappear from the caller's next request.
+    (draft.instructions ??= []).push({ inputHash, ...(operationId ? { operationId } : {}), history: session.snapshot.history,
+      texts, phase: "queued", updatedAt: Date.now() });
+    this.save(session, draft);
+  }
+
+  private async interruptGeneration(session: Session): Promise<void> {
+    const leg = session.active!;
+    const worker = session.worker!;
+    leg.interrupting = true;
+    let timer!: ReturnType<typeof setTimeout>;
+    try {
+      await Promise.race([Promise.all([worker.interrupt(), leg.done]), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new ClaudeSessionError("Claude did not confirm the interrupted turn boundary.", "claude_interrupt_unconfirmed", 504, true)), 10_000);
+      })]);
+    } catch (error) {
+      this.fail(session, error instanceof Error ? error : new Error(String(error))); throw error;
+    } finally { clearTimeout(timer); }
+  }
+
+  private finishInterrupted(session: Session): void {
+    const leg = session.active!;
+    if (leg.interrupting) {
+      session.queued = [];
+      for (const id of leg.mcpIds) {
+        session.pending.get(id)?.reject(new Error("The native turn was interrupted before external delivery."));
+        session.pending.delete(id);
+      }
+    }
+    const toolStart = leg.receipt.events.findIndex(event => event.type === "tool_call_start");
+    leg.receipt.events = (toolStart < 0 ? leg.receipt.events : leg.receipt.events.slice(0, toolStart))
+      .filter(event => event.type !== "error" && event.type !== "done");
+    leg.receipt.calls = [];
+    leg.receipt.phase = "interrupted";
+    leg.receipt.updatedAt = Date.now();
+    leg.receipt.events.push({ type: "incomplete", reason: "superseded", endTurn: false, retryable: false,
+      ...(leg.state.partialUsage ? { usage: leg.state.partialUsage } : {}) });
+    this.save(session);
+    this.finishLeg(session, leg);
+  }
+
+  private finishLeg(session: Session, leg: Leg): void {
+    leg.finished = true;
+    if (leg.timer) clearTimeout(leg.timer);
+    releaseOpenToolBlocks(leg.state);
+    leg.state.translatorBudget?.dispose();
+    leg.release(); leg.release = () => {};
+    leg.input = undefined;
+    this.publish(session);
+    leg.settle();
+  }
+
   private newLeg(session: Session, input: ClaudePersistentTurn, inputHash: string, historyHash: string, operationId?: string, requestHash = inputHash): Leg {
     let settle!: () => void;
     const receipt: ClaudeTurnReceipt = { inputHash, historyHash, ...(operationId ? { operationId } : {}),
@@ -261,12 +389,15 @@ export class ClaudeSessionManager {
       input, receipt, state: { sawPartialText: false, sawPartialThinking: false, sawTerminalResult: false,
         openToolBlocks: new Map(), partialToolCallIds: new Set(), strictToolBlockCapture: true, translatorBudget: createTranslatorBudget(),
         completeAssistantToolUse: true, toolBridgeNames: input.bridge.emittedNameMap, maxToolBlockStarts: CODEBUDDY_TOOL_LIMITS.maxTurnToolCalls },
-      nativeNames: new Map(), mcpIds: new Set(), recoveredCalls: new Set(), buffered: false, finished: false, bytes: 0,
+      nativeNames: new Map(), mcpIds: new Set(), buffered: false, finished: false, bytes: 0,
+      nativeId: crypto.randomUUID(), instructionIds: [],
       done: new Promise(resolve => { settle = resolve; }), settle: () => settle(), release: () => {},
     };
     session.snapshot.turns.push(receipt);
     session.active = leg;
-    leg.timer = setTimeout(() => this.fail(session, new ClaudeSessionError("Claude generation timed out.", "claude_session_timeout", 504, true)), this.deps.timeoutMs ?? 300_000);
+    leg.timer = setTimeout(() => {
+      if (session.active === leg && !leg.finished) this.fail(session, new ClaudeSessionError("Claude generation timed out.", "claude_session_timeout", 504, true));
+    }, this.deps.timeoutMs ?? 300_000);
     leg.timer.unref?.();
     return leg;
   }
@@ -290,6 +421,20 @@ export class ClaudeSessionManager {
   private onMessage(session: Session, message: Record<string, unknown>): void {
     const leg = session.active;
     if (!leg || leg.finished) return;
+    if (typeof message.user_message_uuid === "string" && message.user_message_uuid !== leg.nativeId
+      && !(Array.isArray(message.user_message_uuids) && message.user_message_uuids.includes(leg.nativeId))) return;
+    if (leg.interrupting) {
+      if (message.type === "result") {
+        leg.state.partialUsage = usageFromResult(message) ?? leg.state.partialUsage;
+        try { this.finishInterrupted(session); }
+        catch (error) { this.fail(session, error instanceof Error ? error : new Error(String(error))); }
+      }
+      return;
+    }
+    if (leg.waitingResults) {
+      if (message.type === "result") this.fail(session, new ClaudeSessionError("Claude ended its native turn before the external results arrived.", "claude_tool_continuation_lost", 502, true));
+      return;
+    }
     try {
       leg.bytes += Buffer.byteLength(JSON.stringify(message));
       if (leg.bytes > 64 * 1024 * 1024) throw new ClaudeSessionError("Claude output exceeded its buffer limit.", "claude_session_buffer_limit", 502);
@@ -364,7 +509,7 @@ export class ClaudeSessionManager {
     const onAbort = (): void => {
       const error = new ClaudeSessionError("The Claude MCP request was cancelled.", "claude_mcp_call_cancelled", 499, true);
       reject(error);
-      if (session.epoch === epoch && session.worker) this.fail(session, error);
+      if (!leg?.interrupting && session.epoch === epoch && session.worker) this.fail(session, error);
     };
     signal.addEventListener("abort", onAbort, { once: true });
     const pending: Pending = { signature, promise, settled: false,
@@ -380,6 +525,7 @@ export class ClaudeSessionManager {
 
   private finishTools(session: Session): void {
     const leg = session.active;
+    if (leg?.interrupting || leg?.waitingResults) return;
     if (leg && !leg.finished && leg.waitingTools) {
       leg.waitingTools = false;
       leg.buffered = true;
@@ -399,10 +545,6 @@ export class ClaudeSessionManager {
       return;
     }
     for (const call of leg.receipt.calls) {
-      if (leg.recoveredCalls.has(claudeDigest([call.name, JSON.parse(call.arguments)]))) {
-        this.fail(session, new ClaudeSessionError("Claude tried to repeat an action whose result was already restored. Automatic execution was refused.", "claude_recovery_repeat_refused"));
-        return;
-      }
       const pending = session.pending.get(call.id);
       if (!pending) continue;
       const name = leg.nativeNames.get(call.id)!.slice(CODEBUDDY_MCP_TOOL_PREFIX.length);
@@ -440,21 +582,18 @@ export class ClaudeSessionManager {
 
   private complete(session: Session, phase: "tools" | "completed", terminal: AdapterEvent): void {
     const leg = session.active!;
-    leg.receipt.events.push(terminal);
-    leg.receipt.phase = phase;
-    leg.receipt.updatedAt = Date.now();
-    session.snapshot.history = claudeHistory([...leg.input!.parsed.context.messages, this.assistant(leg.receipt)]);
-    try { this.save(session); }
-    catch { leg.receipt.events.pop(); this.fail(session, new ClaudeSessionError("The Claude receipt could not be committed; no tool action was released.", "claude_journal_write_failed", 503)); return; }
-    leg.finished = true;
-    if (leg.timer) clearTimeout(leg.timer);
-    releaseOpenToolBlocks(leg.state);
-    leg.state.translatorBudget?.dispose();
-    leg.release();
-    leg.release = () => {};
-    leg.input = undefined;
-    this.publish(session);
-    leg.settle();
+    const draft = structuredClone(session.snapshot);
+    const receipt = draft.turns.find(turn => turn.inputHash === leg.receipt.inputHash)!;
+    receipt.events.push(terminal);
+    receipt.phase = phase;
+    receipt.updatedAt = Date.now();
+    draft.history = claudeHistory([...leg.input!.parsed.context.messages, this.assistant(receipt)]);
+    if (phase === "completed") for (const entry of draft.instructions ?? []) {
+      if (leg.instructionIds.includes(entry.inputHash)) entry.phase = "completed";
+    }
+    try { this.save(session, draft); }
+    catch { this.fail(session, new ClaudeSessionError("The Claude receipt could not be committed; no tool action was released.", "claude_journal_write_failed", 503)); return; }
+    this.finishLeg(session, leg);
   }
 
   private assistant(receipt: ClaudeTurnReceipt): OcxMessage {
@@ -501,12 +640,15 @@ export class ClaudeSessionManager {
       try { this.save(session); }
       catch (error) { receipt.deliveryStarted = previous; throw error; }
     }
-    for (const event of receipt.events) emit(event.type === "done" && event.usage
+    for (const event of receipt.events) emit((event.type === "done" || event.type === "incomplete") && event.usage
       ? { ...event, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } } : event);
   }
 
   private save(session: Session, snapshot = session.snapshot, pinned: ClaudeTurnReceipt[] = []): void {
     const draft = structuredClone(snapshot);
+    const completedInstructions = draft.instructions?.filter(entry => entry.phase === "completed") ?? [];
+    const expiredInstructions = new Set(completedInstructions.slice(0, -16).map(entry => entry.inputHash));
+    if (expiredInstructions.size) draft.instructions = draft.instructions!.filter(entry => !expiredInstructions.has(entry.inputHash));
     const protectedHashes = new Set([session.active?.receipt.inputHash, ...pinned.map(turn => turn.inputHash)]);
     const retained = draft.turns.filter(turn => (turn.phase === "completed" || turn.phase === "interrupted")
       && !protectedHashes.has(turn.inputHash) && !turn.calls.some(call => session.pending.get(call.id)?.settled === false));
@@ -523,6 +665,7 @@ export class ClaudeSessionManager {
       if (old.phase !== "expired") expire(old);
     }
     this.journal.save(session.scope, draft);
+    if (expiredInstructions.size) snapshot.instructions = snapshot.instructions!.filter(entry => !expiredInstructions.has(entry.inputHash));
     for (const turn of snapshot.turns) if (expired.has(turn.inputHash)) {
       for (const call of turn.calls) session.pending.delete(call.id);
       turn.phase = "expired"; turn.calls = []; turn.events = [];
@@ -560,6 +703,7 @@ export class ClaudeSessionManager {
   private stopWorker(session: Session): void {
     const worker = session.worker;
     session.worker = undefined;
+    session.nativeId = undefined;
     session.epoch++;
     session.queued = [];
     worker?.stop();

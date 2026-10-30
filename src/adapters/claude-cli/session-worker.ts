@@ -28,7 +28,19 @@ export interface ClaudeWorkerOptions {
 }
 
 export interface ClaudeSessionWorker {
-  send(text: string): void;
+  /**
+   * Resolves when the SDK resumes input after its awaited transport write, not on a result
+   * or native consumption. Pending writes reject on shutdown. shouldQuery:false appends
+   * without starting a turn; consumption is confirmed by result.user_message_uuids.
+   */
+  send(text: string, options?: { uuid?: string; shouldQuery?: boolean; priority?: "now" | "next" | "later" }): Promise<void>;
+  /**
+   * Resolves on the SDK control acknowledgment, which can precede the terminal result.
+   * The owner must drain onMessage through that result before replacing the active turn;
+   * waiting for it here can deadlock an interrupt awaited inside onMessage. This does not
+   * shut down the owned process/input stream or synthesize external tool results.
+   */
+  interrupt(): Promise<void>;
   updateTools(tools: CodingAgentMcpTool[]): Promise<void>;
   stop(): void;
 }
@@ -53,7 +65,8 @@ export async function createClaudeSessionWorker(options: ClaudeWorkerOptions): P
     ...SDK_ENV,
   };
   const abort = new AbortController();
-  const input: SDKUserMessage[] = [];
+  const input: Array<{ frame: SDKUserMessage; resolve: () => void; reject: (error: Error) => void }> = [];
+  const pendingWrites = new Set<(error: Error) => void>();
   let wake: (() => void) | undefined;
   let stopped = false;
   let session: Query | undefined;
@@ -67,10 +80,13 @@ export async function createClaudeSessionWorker(options: ClaudeWorkerOptions): P
   function stop(): void {
     if (stopped) return;
     stopped = true;
+    const error = new Error("Claude session worker stopped");
+    for (const reject of pendingWrites) reject(error);
+    pendingWrites.clear();
     input.length = 0;
     wake?.();
     wake = undefined;
-    abort.abort(new Error("Claude session worker stopped"));
+    abort.abort(error);
     // Kill only our still-live child (and its descendants), never a discovered user CLI.
     if (child?.pid && child.exitCode === null && child.signalCode === null) {
       try {
@@ -129,7 +145,11 @@ export async function createClaudeSessionWorker(options: ClaudeWorkerOptions): P
   async function* userFrames(): AsyncGenerator<SDKUserMessage> {
     while (!stopped) {
       const message = input.shift();
-      if (message) yield message;
+      if (message) {
+        yield message.frame;
+        // SDK streamInput resumes only after awaiting transport.write for this frame.
+        if (pendingWrites.delete(message.reject)) message.resolve();
+      }
       else await new Promise<void>(resolve => { wake = resolve; });
     }
   }
@@ -142,6 +162,7 @@ export async function createClaudeSessionWorker(options: ClaudeWorkerOptions): P
         model: options.model,
         // SDK 0.3.314 sends this through initialize on stdin, never argv.
         systemPrompt: options.systemPrompt,
+        verbatimPrompts: true,
         effort,
         env: { ...env },
         abortController: abort,
@@ -191,11 +212,38 @@ export async function createClaudeSessionWorker(options: ClaudeWorkerOptions): P
   })();
 
   return {
-    send(text) {
+    send(text, options) {
       if (stopped) throw new Error("Claude session worker stopped");
-      input.push({ type: "user", message: { role: "user", content: text }, parent_tool_use_id: null });
+      const frame: SDKUserMessage = { type: "user", message: { role: "user", content: text }, parent_tool_use_id: null };
+      if (options?.uuid !== undefined) {
+        if (typeof options.uuid !== "string" || !/^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i.test(options.uuid)) {
+          throw new Error("Invalid Claude worker message UUID");
+        }
+        frame.uuid = options.uuid as SDKUserMessage["uuid"];
+      }
+      if (options?.shouldQuery !== undefined) {
+        if (typeof options.shouldQuery !== "boolean") throw new Error("Invalid Claude worker shouldQuery");
+        frame.shouldQuery = options.shouldQuery;
+      }
+      if (options?.priority !== undefined) {
+        if (options.priority !== "now" && options.priority !== "next" && options.priority !== "later") {
+          throw new Error("Invalid Claude worker priority");
+        }
+        frame.priority = options.priority;
+      }
+      const written = new Promise<void>((resolve, reject) => {
+        pendingWrites.add(reject);
+        input.push({ frame, resolve, reject });
+      });
+      // Existing fire-and-forget callers must not create an unhandled rejection on stop.
+      void written.catch(() => {});
       wake?.();
       wake = undefined;
+      return written;
+    },
+    async interrupt() {
+      if (stopped) throw new Error("Claude session worker stopped");
+      await session!.interrupt();
     },
     async updateTools(updated) {
       if (stopped) throw new Error("Claude session worker stopped");

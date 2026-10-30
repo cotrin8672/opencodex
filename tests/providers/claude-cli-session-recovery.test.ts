@@ -3,6 +3,7 @@ import { claudeDigest, claudeResult } from "../../src/adapters/claude-cli/sessio
 import { ClaudeSessionError } from "../../src/adapters/claude-cli/session-errors";
 import type { ClaudeSessionSnapshot, ClaudeToolReceipt } from "../../src/adapters/claude-cli/session-journal";
 import { prepareClaudeToolResults } from "../../src/adapters/claude-cli/session-recovery";
+import { parseRequest } from "../../src/responses/parser";
 import type { OcxMessage, OcxToolCall } from "../../src/types";
 
 const user = (content: string): OcxMessage => ({ role: "user", content, timestamp: 0 });
@@ -49,7 +50,7 @@ test("stages a partial batch on detached state so the manager can commit before 
   expect(prepared.pendingTurns[0]!.deliveryStarted).toBe(true);
   expect(prepared.pendingTurns[0]!.calls[0]!.result).toEqual(claudeResult(result("A", "saved A")));
   expect(prepared.pendingTurns.some(turn => turn.calls.some(call => !call.result))).toBe(true);
-  expect(prepared.recoveredCalls).toEqual(new Set([claudeDigest(["read_file", { path: "A.txt" }])]));
+  expect(prepared.recoveredCalls).toEqual(new Set(["A"]));
   prepared.snapshot.history.push("detached");
   prepared.pendingTurns[0]!.events.push({ type: "text_delta", text: "detached" });
   prepared.messages[0]!.timestamp++;
@@ -103,9 +104,7 @@ test("restores saved A beside its original call even with B and a final user con
     { role: "toolResult", toolCallId: "A", toolName: "read_file", content: "saved A", isError: true, timestamp: 123 },
     messages[2], messages[3],
   ]);
-  expect(prepared.recoveredCalls).toEqual(new Set([
-    claudeDigest(["read_file", { path: "A.txt" }]), claudeDigest(["read_file", { path: "B.txt" }]),
-  ]));
+  expect(prepared.recoveredCalls).toEqual(new Set(["A", "B"]));
   expect(prepared.pendingTurns[0]!.calls.every(call => call.result)).toBe(true);
   expect(prepared.pendingTurns[0]!.phase).toBe("tools");
   expect(messages).toHaveLength(4);
@@ -173,18 +172,16 @@ test("preserves namespace in reconstructed output and compares arguments canonic
   }] };
   const prepared = prepareClaudeToolResults(saved, [user("read"), origin, user("continue")]);
   expect(prepared.messages[2]).toMatchObject({ toolCallId: "A", toolName: "read_file", toolNamespace: "mcp__files", content: "namespaced output" });
-  expect(prepared.recoveredCalls).toEqual(new Set([claudeDigest([call.name, JSON.parse(call.arguments)])]));
+  expect(prepared.recoveredCalls).toEqual(new Set(["A"]));
 });
 
-test("collects all outstanding available signatures across turns, regardless of trailing role", () => {
+test("collects all outstanding available call IDs across turns, regardless of trailing role", () => {
   const saved = snapshot([receipt("A", "A")]);
   saved.turns[0]!.deliveryStarted = true;
   saved.turns.push({ ...structuredClone(saved.turns[0]!), inputHash: claudeDigest("second turn"), calls: [receipt("B", "B")] });
   const messages = [...history(saved), result("A", "A"), assistant(saved.turns[1]!.calls), result("B", "B"), user("continue")];
   const prepared = prepareClaudeToolResults(saved, messages);
-  expect(prepared.recoveredCalls).toEqual(new Set([
-    claudeDigest(["read_file", { path: "A.txt" }]), claudeDigest(["read_file", { path: "B.txt" }]),
-  ]));
+  expect(prepared.recoveredCalls).toEqual(new Set(["A", "B"]));
   expect(prepared.messages).toEqual(messages);
   expect(prepared.changed).toBe(false);
   expect(prepared.pendingTurns.map(turn => turn.phase)).toEqual(["tools", "tools"]);
@@ -202,13 +199,18 @@ test("restores multiple saved results beside each turn's own assistant call in r
   expect(prepareClaudeToolResults(prepared.snapshot, prepared.messages).messages).toEqual(prepared.messages);
 });
 
-test("old completed results remain immutable and do not enter the outstanding recovery guard", () => {
+test("completed receipts remain authoritative when later history changes their output or error bit", () => {
   const saved = snapshot([receipt("A", "original")]);
   saved.turns[0]!.phase = "completed";
   saved.turns[0]!.deliveryStarted = true;
   const before = structuredClone(saved);
   for (const changed of [result("A", "replacement"), result("A", "original", true)]) {
-    expectCode(() => prepareClaudeToolResults(saved, [...history(saved), changed]), "claude_tool_result_conflict");
+    const prepared = prepareClaudeToolResults(saved, [...history(saved), changed, user("new question")]);
+    expect(prepared.messages[2]).toMatchObject({ content: "original", isError: false });
+    expect(prepared.messages.at(-1)).toEqual(user("new question"));
+    expect(prepared.snapshot).toEqual(before);
+    expect(prepared.changed).toBe(false);
+    expect(prepared.pendingTurns).toEqual([]);
     expect(saved).toEqual(before);
   }
   const prepared = prepareClaudeToolResults(saved, [...history(saved), result("A", "original"), user("continue")]);
@@ -217,6 +219,102 @@ test("old completed results remain immutable and do not enter the outstanding re
   expect(prepared.recoveredCalls.size).toBe(0);
   expect(prepared.snapshot).toEqual(before);
   expect(prepareClaudeToolResults(saved, [user("new question")]).messages).toEqual([user("new question")]);
+});
+
+test.each(["function", "custom"] as const)("normalizes shortened historical %s outputs through the Responses parser", kind => {
+  const call = receipt("A", "authoritative full output", true);
+  if (kind === "custom") call.arguments = JSON.stringify({ input: "read A.txt" });
+  const saved = snapshot([call]);
+  saved.turns[0]!.phase = "completed";
+  saved.turns[0]!.deliveryStarted = true;
+  const before = structuredClone(saved);
+  for (const output of ["authoritative…[truncated]", [{ type: "input_text", text: "shortened context" }], "Error calling tool: stream interrupted"]) {
+    const messages = parseRequest({ model: "test/model", input: [
+      { role: "user", content: "read files" },
+      kind === "function"
+        ? { type: "function_call", call_id: "A", name: call.name, arguments: call.arguments }
+        : { type: "custom_tool_call", call_id: "A", name: call.name, input: "read A.txt" },
+      { type: kind === "function" ? "function_call_output" : "custom_tool_call_output", call_id: "A", output },
+      { role: "user", content: "new question" },
+    ] }).context.messages;
+    const inputBefore = structuredClone(messages);
+    expect(messages.find(message => message.role === "toolResult")).toMatchObject({ isError: false });
+    const prepared = prepareClaudeToolResults(saved, messages);
+    expect(prepared.messages.find(message => message.role === "toolResult")).toMatchObject({
+      toolCallId: "A", content: "authoritative full output", isError: true,
+    });
+    expect(prepared.messages.at(-1)).toMatchObject({ role: "user", content: "new question" });
+    expect(prepared.snapshot).toEqual(before);
+    expect(prepared.changed).toBe(false);
+    expect(messages).toEqual(inputBefore);
+  }
+});
+
+test("completed acknowledgement resolves placeholder and real-output duplicates in either order", () => {
+  const saved = snapshot([receipt("A", "actual output")]);
+  saved.turns[0]!.phase = "completed";
+  saved.turns[0]!.deliveryStarted = true;
+  const placeholder = result("A", "[ocx] no tool result was recorded; execution status unknown", true);
+  const real = result("A", "actual output");
+  for (const outputs of [[placeholder, real], [real, placeholder]]) {
+    const messages = [...history(saved), ...outputs, user("continue")];
+    const before = structuredClone({ saved, messages });
+    const prepared = prepareClaudeToolResults(saved, messages);
+    expect(prepared.messages.filter(message => message.role === "toolResult").map(claudeResult))
+      .toEqual([saved.turns[0]!.calls[0]!.result!, saved.turns[0]!.calls[0]!.result!]);
+    expect(prepared.pendingTurns).toEqual([]);
+    expect(prepared.recoveredCalls.size).toBe(0);
+    expect(prepared.changed).toBe(false);
+    expect({ saved, messages }).toEqual(before);
+  }
+});
+
+test.each(["tools", "interrupted", "running"] as const)("placeholder wording cannot settle competing %s results", phase => {
+  for (const committed of [false, true]) {
+    const saved = snapshot([receipt("A", committed ? "actual output" : undefined)]);
+    saved.turns[0]!.phase = phase;
+    saved.turns[0]!.deliveryStarted = true;
+    const placeholder = result("A", "[ocx] no tool result was recorded; execution status unknown", true);
+    const real = result("A", "actual output");
+    for (const outputs of [[placeholder, real], [real, placeholder]]) {
+      const messages = [...history(saved), ...outputs, user("continue")];
+      const before = structuredClone({ saved, messages });
+      expectCode(() => prepareClaudeToolResults(saved, messages), "claude_tool_result_conflict");
+      expect({ saved, messages }).toEqual(before);
+    }
+  }
+});
+
+test("a completed phase without a saved result cannot authorize competing outputs", () => {
+  const saved = snapshot([receipt("A")]);
+  saved.turns[0]!.phase = "completed";
+  expectCode(() => prepareClaudeToolResults(saved, [...history(saved), result("A", "first"), result("A", "second")]),
+    "claude_tool_result_conflict");
+});
+
+test.each(["name", "arguments", "namespace"] as const)("completed result normalization still rejects changed call %s", field => {
+  const saved = snapshot([receipt("A", "authoritative")]);
+  saved.turns[0]!.phase = "completed";
+  saved.turns[0]!.deliveryStarted = true;
+  const origin = assistant(saved.turns[0]!.calls);
+  if (origin.role !== "assistant") throw new Error("expected assistant");
+  const call = origin.content[0] as OcxToolCall;
+  if (field === "arguments") call.arguments = { path: "changed.txt" };
+  else call[field] = "changed";
+  const messages = [user("read"), origin, result("A", "shortened"), user("continue")];
+  const before = structuredClone({ saved, messages });
+  expectCode(() => prepareClaudeToolResults(saved, messages), "claude_tool_id_conflict");
+  expect({ saved, messages }).toEqual(before);
+});
+
+test("recovery tracks exact call IDs even when separate actions share the same name and arguments", () => {
+  const a = receipt("A", "first read");
+  const b = { ...receipt("B", "second read"), arguments: a.arguments };
+  const saved = snapshot([a, b]);
+  const prepared = prepareClaudeToolResults(saved, [...history(saved), user("continue")]);
+  expect(prepared.recoveredCalls).toEqual(new Set(["A", "B"]));
+  expect(prepared.recoveredCalls.has(claudeDigest([a.name, JSON.parse(a.arguments)]))).toBe(false);
+  expect(prepared.messages.filter(message => message.role === "toolResult").map(message => message.toolCallId)).toEqual(["A", "B"]);
 });
 
 test("an unfinished interrupted argument buffer does not break unrelated history preparation", () => {
@@ -237,7 +335,7 @@ test("restores an omitted completed result after a continuation crash when its o
   const prepared = prepareClaudeToolResults(saved, messages);
   expect(prepared.messages[2]).toMatchObject({ role: "toolResult", toolCallId: "A", content: "committed before worker crash" });
   expect(prepared.messages.at(-1)).toEqual(user("continue"));
-  expect(prepared.recoveredCalls).toEqual(new Set([claudeDigest(["read_file", { path: "A.txt" }])]));
+  expect(prepared.recoveredCalls).toEqual(new Set(["A"]));
   expect(prepared.pendingTurns).toEqual([]);
   expect(prepared.snapshot.turns[0]!.phase).toBe("completed");
   expect(prepared.changed).toBe(false);

@@ -111,6 +111,42 @@ test.each([undefined, "a".repeat(64), "B".repeat(64)])("preserves optional v1 re
   expect(open().load(scope)).toEqual(saved);
 });
 
+test.each(["queued", "sent", "completed"] as const)("round-trips optional v1 %s instructions and replay aliases", phase => {
+  const saved = snapshot();
+  saved.instructions = [{
+    inputHash: scope, operationId: otherScope, history: saved.history, texts: ["Keep it local", "Then summarize"], phase, updatedAt: 456,
+  }];
+  saved.turns[0]!.requestHashes = [scope, otherScope];
+  open().save(scope, saved);
+  journal!.close();
+  expect(open().load(scope)).toEqual(saved);
+  saved.instructions[0]!.texts.push("changed");
+  const loaded = journal!.load(scope)!;
+  loaded.instructions![0]!.texts.length = 0;
+  loaded.turns[0]!.requestHashes!.length = 0;
+  expect(journal!.load(scope)!.instructions![0]!.texts).toEqual(["Keep it local", "Then summarize"]);
+  expect(journal!.load(scope)!.turns[0]!.requestHashes).toEqual([scope, otherScope]);
+});
+
+test("accepts bounded instruction queues without operation metadata and empty optional v1 arrays", () => {
+  const saved = snapshot();
+  saved.instructions = [];
+  saved.turns[0]!.requestHashes = [];
+  open().save(scope, saved);
+  expect(journal!.load(scope)).toEqual(saved);
+  saved.instructions = Array.from({ length: 64 }, () => ({
+    inputHash: scope, history: [], texts: Array.from({ length: 64 }, () => "literal text"), phase: "queued", updatedAt: 0,
+  }));
+  saved.instructions.push(...Array.from({ length: 16 }, () => ({
+    inputHash: otherScope, history: [], texts: ["completed instruction"], phase: "completed" as const, updatedAt: 0,
+  })));
+  expect(saved.instructions).toHaveLength(80);
+  saved.turns[0]!.requestHashes = Array.from({ length: 64 }, () => otherScope);
+  journal!.save(scope, saved);
+  journal!.close();
+  expect(open().load(scope)).toEqual(saved);
+});
+
 test.each(["running", "tools", "completed", "interrupted", "expired"] as const)("accepts %s receipts without delivery metadata", phase => {
   const saved = snapshot();
   saved.turns[0]!.phase = phase;
@@ -156,12 +192,24 @@ test("rejects malformed, unsupported, and out-of-bounds snapshots on save and lo
   const valid = snapshot();
   const turn = valid.turns[0]!;
   const withTurn = (patch: Record<string, unknown>) => ({ ...valid, turns: [{ ...turn, ...patch }] });
+  const instruction = { inputHash: scope, history: valid.history, texts: ["Keep it local"], phase: "queued", updatedAt: 0 };
+  const withInstruction = (patch: Record<string, unknown>) => ({ ...valid, instructions: [{ ...instruction, ...patch }] });
   const invalid: unknown[] = [
     null, [], {}, { ...valid, version: 2 }, { ...valid, extra: "unexpected" },
     { ...valid, history: ["not a hash"] }, { ...valid, history: "history" }, { ...valid, turns: {} },
     withTurn({ inputHash: "invalid" }), withTurn({ phase: "pending" }),
     ...["", "a".repeat(63), "a".repeat(65), "g".repeat(64), null, 123].map(operationId => withTurn({ operationId })),
     ...["", "a".repeat(63), "a".repeat(65), "g".repeat(64), null, 123].map(requestHash => withTurn({ requestHash })),
+    ...[null, "hash", {}, ["bad"], [null], Array.from({ length: 65 }, () => scope)].map(requestHashes => withTurn({ requestHashes })),
+    ...[null, {}, "instructions", [null], Array.from({ length: 81 }, () => instruction)].map(instructions => ({ ...valid, instructions })),
+    withInstruction({ extra: true }), withInstruction({ phase: "pending" }),
+    ...["", "a".repeat(63), "a".repeat(65), "g".repeat(64), null, 123].flatMap(value => [
+      withInstruction({ inputHash: value }), withInstruction({ operationId: value }), withInstruction({ history: [value] }),
+      withTurn({ requestHashes: [value] }),
+    ]),
+    withInstruction({ history: null }), withInstruction({ history: "history" }),
+    ...[null, "text", [], [""], [123], Array.from({ length: 65 }, () => "text")].map(texts => withInstruction({ texts })),
+    ...[-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1].map(updatedAt => withInstruction({ updatedAt })),
     withTurn({ updatedAt: -1 }), withTurn({ updatedAt: NaN }), withTurn({ updatedAt: Infinity }),
     withTurn({ updatedAt: 0.5 }), withTurn({ updatedAt: Number.MAX_SAFE_INTEGER + 1 }),
     withTurn({ deliveryStarted: "true" }), withTurn({ deliveryStarted: null }),
@@ -209,6 +257,22 @@ test("enforces the 16 MiB UTF-8 boundary on save and load", () => {
   event.text += "é";
   expect(() => journal!.save(scope, saved)).toThrow("save failed");
   expect((journal!.load(scope)!.turns[0]!.events[0] as typeof event).text.length).toBe(length);
+  database = new Database(path);
+  database.run("UPDATE claude_sessions SET payload = ? WHERE scope = ?", [JSON.stringify(saved), scope]);
+  expect(() => journal!.load(scope)).toThrow("load failed");
+});
+
+test("counts private instruction text toward the existing 16 MiB UTF-8 record boundary", () => {
+  const saved = snapshot();
+  saved.instructions = [{ inputHash: scope, history: [], texts: [""], phase: "sent", updatedAt: 0 }];
+  const instruction = saved.instructions[0]!;
+  instruction.texts[0] = "x".repeat(MAX_RECORD_BYTES - Buffer.byteLength(JSON.stringify(saved)));
+  expect(Buffer.byteLength(JSON.stringify(saved))).toBe(MAX_RECORD_BYTES);
+  open().save(scope, saved);
+  expect(journal!.load(scope)).toEqual(saved);
+  instruction.texts[0] += "é";
+  expect(() => journal!.save(scope, saved)).toThrow("save failed");
+  expect(Buffer.byteLength(JSON.stringify(journal!.load(scope)))).toBe(MAX_RECORD_BYTES);
   database = new Database(path);
   database.run("UPDATE claude_sessions SET payload = ? WHERE scope = ?", [JSON.stringify(saved), scope]);
   expect(() => journal!.load(scope)).toThrow("load failed");

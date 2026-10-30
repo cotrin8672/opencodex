@@ -8,6 +8,11 @@
   "claude-cli-session-retention.test.ts": "providers",
   "claude-cli-session-lifecycle.test.ts": "providers",
   "claude-cli-session-native.test.ts": "providers",
+  "claude-cli-session-worker-native.test.ts": "providers",
+  "claude-cli-session-followup-native.test.ts": "providers",
+  "claude-cli-session-followup.test.ts": "providers",
+  "claude-cli-session-instructions.test.ts": "providers",
+  "claude-cli-session-replay-order.test.ts": "providers",
   "free-directory-runcrate.test.ts": "providers",
   "cc-switch-import.test.ts": "providers",
   "kiro-completion-with-real-tools.test.ts": "providers/kiro"

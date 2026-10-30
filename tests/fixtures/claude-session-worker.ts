@@ -64,10 +64,18 @@ export async function until(check: () => boolean): Promise<void> {
 const envelope = { uuid: "00000000-0000-4000-8000-000000000001", session_id: "offline-session", parent_tool_use_id: null };
 export class ControlledWorker implements ClaudeSessionWorker {
   sends: string[] = [];
+  sendOptions: Array<{ uuid?: string; shouldQuery?: boolean; priority?: "now" | "next" | "later" } | undefined> = [];
   updates: ClaudeWorkerOptions["tools"][] = [];
   stops = 0;
+  interrupts = 0;
   constructor(readonly options: ClaudeWorkerOptions) {}
-  send(text: string) { this.sends.push(text); }
+  async send(text: string, options?: { uuid?: string; shouldQuery?: boolean; priority?: "now" | "next" | "later" }) {
+    this.sends.push(text); this.sendOptions.push(options);
+  }
+  async interrupt() {
+    this.interrupts++;
+    await this.emit({ type: "result", subtype: "success", is_error: false, result: "", usage: { input_tokens: 0, output_tokens: 0 } });
+  }
   async updateTools(tools: ClaudeWorkerOptions["tools"]) { this.updates.push(structuredClone(tools)); }
   stop() { this.stops++; }
   async emit(message: Record<string, unknown>) { await this.options.onMessage({ ...envelope, ...message }); }

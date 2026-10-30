@@ -52,21 +52,23 @@ describe("Claude session interruption and recovery", () => {
     expect(first.worker.sends[1]).toBe("next");
   });
 
-  test("supersedes active generation, retains all new instructions, and ignores stale worker events", async () => {
+  test("interrupts the active turn on the same worker and ignores old turn frames", async () => {
     const h = harness();
     const input = turn([user("remember the original context")]);
     const first = await h.start(input);
     await first.worker.begin();
     const replacement = h.run(withMessages(input, [...input.parsed.context.messages, user("new steering instruction")]));
-    await until(() => h.workers[1]?.sends.length === 1);
+    await until(() => first.worker.sends.length === 2);
     await first.done;
-    expect(first.events.at(-1)).toMatchObject({ type: "error", code: "claude_turn_superseded" });
-    expect(first.worker.stops).toBe(1);
-    expect(h.workers[1]!.sends[0]).toContain("remember the original context");
-    expect(h.workers[1]!.sends[0]).toContain("new steering instruction");
-    first.worker.options.onError(new Error("late error from replaced worker"));
-    await first.worker.finish("stale output");
-    await h.workers[1]!.finish("new output");
+    expect(first.events.at(-1)).toMatchObject({ type: "incomplete", reason: "superseded" });
+    expect(first.worker.stops).toBe(0);
+    expect(first.worker.interrupts).toBe(1);
+    expect(first.worker.sends[0]).toContain("remember the original context");
+    expect(first.worker.sends[1]).toBe("new steering instruction");
+    const user_message_uuid = first.worker.sendOptions[0]!.uuid;
+    await first.worker.emit({ type: "assistant", user_message_uuid, message: { role: "assistant", content: [{ type: "text", text: "stale output" }] } });
+    await first.worker.emit({ type: "result", user_message_uuid, subtype: "error_during_execution", is_error: true, errors: ["old turn error"] });
+    await first.worker.finish("new output");
     await replacement.done;
     expect(replacement.events).toContainEqual({ type: "text_delta", text: "new output" });
     expect(replacement.events.some(event => event.type === "error" || (event.type === "text_delta" && event.text === "stale output"))).toBe(false);
@@ -105,20 +107,22 @@ describe("Claude session interruption and recovery", () => {
     expect(next.events.some(event => event.type === "tool_call_start")).toBe(false);
   });
 
-  test("an instruction inserted before a tool result forces a complete history bootstrap", async () => {
+  test("an instruction inserted before a tool result reaches the same worker before MCP continuation", async () => {
     const h = harness();
     const input = turn();
     const first = await h.start(input);
     const action = call(input, "steering_tool");
-    first.worker.mcp(action);
+    const pending = first.worker.mcp(action);
     await first.worker.blocks([action]);
     await first.done;
-    const next = await h.start(withMessages(input, [...input.parsed.context.messages, toolAssistant([action]),
+    const next = h.run(withMessages(input, [...input.parsed.context.messages, toolAssistant([action]),
       user("use this additional instruction"), result(action.id, "actual tool output")]));
-    expect(first.worker.stops).toBe(1);
-    expect(next.worker.sends[0]).toContain("use this additional instruction");
-    expect(next.worker.sends[0]).toContain("actual tool output");
-    await next.worker.finish("instruction included");
+    expect((await pending).content[0]!.text).toBe("actual tool output");
+    expect(h.workers).toHaveLength(1);
+    expect(first.worker.stops).toBe(0);
+    expect(first.worker.sends[1]).toBe("use this additional instruction");
+    expect(first.worker.sendOptions[1]).toMatchObject({ shouldQuery: false });
+    await first.worker.finish("instruction included");
     await next.done;
   });
 
@@ -167,7 +171,7 @@ describe("Claude session interruption and recovery", () => {
     await retry.done;
   });
 
-  test("restores a saved output after dispatch refusal and rejects repetition under a fresh call ID", async () => {
+  test("restores a saved output after dispatch refusal and rejects reuse of its recorded call ID", async () => {
     const journal = new MemoryJournal();
     const h = harness(journal);
     const input = turn();
@@ -187,11 +191,11 @@ describe("Claude session interruption and recovery", () => {
     const recovered = await reopened.start(withMessages(input, [...history, user("continue")]));
     expect(recovered.worker.sends[0]).toContain("UNIQUE_SAVED_OUTPUT");
     expect(recovered.worker.sends[0]).toContain("continue");
-    const repeated = call(input, "fresh_repeated");
+    const repeated = call(input, action.id);
     recovered.worker.mcp(repeated);
     await recovered.worker.blocks([repeated]);
     await recovered.done;
     expect(recovered.events.some(event => event.type === "tool_call_start")).toBe(false);
-    expect(recovered.events.at(-1)).toMatchObject({ type: "error", code: "claude_recovery_repeat_refused" });
+    expect(recovered.events.at(-1)).toMatchObject({ type: "error", code: "claude_tool_id_conflict" });
   });
 });

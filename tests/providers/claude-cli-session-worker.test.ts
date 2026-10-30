@@ -36,12 +36,14 @@ async function until(check: () => boolean): Promise<void> {
   expect(check()).toBe(true);
 }
 
-async function harness(overrides: Partial<ClaudeWorkerOptions> = {}) {
+async function harness(overrides: Partial<ClaudeWorkerOptions> = {}, onInterrupt = async () => {}) {
   let options!: Options;
   let input!: AsyncIterator<SDKUserMessage>;
   let controller!: ReadableStreamDefaultController<SDKMessage>;
   let outputClosed = false;
   let queryCalls = 0;
+  let interruptCalls = 0;
+  let closeCalls = 0;
   const client = new Client({ name: "offline-worker-test", version: "1.0.0" });
   const errors: Error[] = [];
   const messages: Record<string, unknown>[] = [];
@@ -60,7 +62,9 @@ async function harness(overrides: Partial<ClaudeWorkerOptions> = {}) {
       for await (const message of output) yield message;
     })();
     return Object.assign(stream, {
+      async interrupt() { interruptCalls++; await onInterrupt(); },
       close() {
+        closeCalls++;
         if (!outputClosed) { outputClosed = true; controller.close(); }
         void client.close();
       },
@@ -84,6 +88,8 @@ async function harness(overrides: Partial<ClaudeWorkerOptions> = {}) {
   return {
     worker, options, input, client, errors, messages,
     queryCalls: () => queryCalls,
+    interruptCalls: () => interruptCalls,
+    closeCalls: () => closeCalls,
     emit(message: Record<string, unknown>) { controller.enqueue(message as SDKMessage); },
     end() { outputClosed = true; controller.close(); },
     error(error: Error) { outputClosed = true; controller.error(error); },
@@ -96,6 +102,116 @@ async function harness(overrides: Partial<ClaudeWorkerOptions> = {}) {
 }
 
 describe("Claude SDK persistent session worker", () => {
+  test("send acknowledges only after the SDK resumes input, independently of results and onMessage", async () => {
+    const blockedMessage = deferred<void>();
+    let entered = false;
+    const h = await harness({ onMessage: () => { entered = true; return blockedMessage.promise; } });
+    h.emit({ type: "assistant" });
+    await until(() => entered);
+    let written = false;
+    const sent = h.worker.send("ordered input").then(() => { written = true; });
+    expect((await h.input.next()).value.message.content).toBe("ordered input");
+    await Bun.sleep(0);
+    expect(written).toBe(false);
+    const next = h.input.next(); // SDK calls next() after its transport write completes.
+    await sent;
+    expect(written).toBe(true);
+    expect(h.messages).toEqual([]);
+    h.worker.stop();
+    expect((await next).done).toBe(true);
+    blockedMessage.resolve();
+  });
+
+  test("stop rejects both the yielded write and queued writes", async () => {
+    const h = await harness();
+    const first = h.worker.send("yielded");
+    const queued = h.worker.send("queued");
+    expect((await h.input.next()).value.message.content).toBe("yielded");
+    h.worker.stop();
+    await expect(first).rejects.toThrow("stopped");
+    await expect(queued).rejects.toThrow("stopped");
+    expect((await h.input.next()).done).toBe(true);
+    expect(h.errors).toEqual([]);
+  });
+
+  test("sends only explicit supported SDK follow-up fields", async () => {
+    const h = await harness();
+    const uuid = "aabbccdd-1234-4567-890a-aabbccddeeff";
+    for (const priority of ["now", "next", "later"] as const) {
+      h.worker.send("follow-up", { uuid, shouldQuery: false, priority, isSynthetic: true } as Parameters<ClaudeSessionWorker["send"]>[1]);
+      expect((await h.input.next()).value).toEqual({
+        type: "user", message: { role: "user", content: "follow-up" }, parent_tool_use_id: null,
+        uuid, shouldQuery: false, priority,
+      });
+    }
+    h.worker.send("query", { shouldQuery: true });
+    expect((await h.input.next()).value.shouldQuery).toBe(true);
+    h.worker.send("default", { uuid: undefined, shouldQuery: undefined, priority: undefined });
+    expect((await h.input.next()).value).toEqual({
+      type: "user", message: { role: "user", content: "default" }, parent_tool_use_id: null,
+    });
+  });
+
+  test.each([{ uuid: "bad\nframe" }, { uuid: 42 }, { shouldQuery: "false" }, { priority: "immediate" }])(
+    "rejects invalid follow-up options before enqueueing: %j", async options => {
+      const h = await harness();
+      expect(() => h.worker.send("invalid", options as Parameters<ClaudeSessionWorker["send"]>[1])).toThrow("Invalid Claude worker");
+      h.worker.send("valid");
+      expect((await h.input.next()).value.message.content).toBe("valid");
+    },
+  );
+
+  test("interrupt awaits only control ack, retains pending MCP and input, and can run inside onMessage", async () => {
+    const ack = deferred<void>();
+    const interrupted = deferred<void>();
+    const receipt = deferred<Awaited<ReturnType<ClaudeWorkerOptions["onToolCall"]>>>();
+    let signal: AbortSignal | undefined;
+    let callDone = false;
+    const seen: string[] = [];
+    const h = await harness({
+      onToolCall: async (_call, value) => { signal = value; return receipt.promise; },
+      onMessage: async message => {
+        seen.push(String(message.type));
+        if (message.type === "assistant") { await h.worker.interrupt(); interrupted.resolve(); }
+      },
+    }, () => ack.promise);
+    const call = h.call("toolu_interrupt_pending");
+    void call.then(() => { callDone = true; });
+    await until(() => signal !== undefined);
+    h.emit({ type: "assistant" });
+    await until(() => h.interruptCalls() === 1);
+    let acked = false;
+    void interrupted.promise.then(() => { acked = true; });
+    await Bun.sleep(0);
+    expect(acked).toBe(false);
+    ack.resolve();
+    await interrupted.promise;
+    expect(seen).toEqual(["assistant"]);
+    expect(signal!.aborted).toBe(false);
+    expect(callDone).toBe(false);
+    expect(h.closeCalls()).toBe(0);
+    h.emit({ type: "result", subtype: "success" });
+    await until(() => seen.length === 2);
+    h.worker.send("same stream after interrupt");
+    expect((await h.input.next()).value.message.content).toBe("same stream after interrupt");
+    receipt.resolve({ content: [{ type: "text", text: "actual external receipt" }] });
+    expect((await call).content).toEqual([{ type: "text", text: "actual external receipt" }]);
+    expect(h.queryCalls()).toBe(1);
+    expect(h.errors).toEqual([]);
+  });
+
+  test("interrupt errors propagate without shutting down the worker; stopped interrupts reject", async () => {
+    const h = await harness({}, async () => { throw new Error("SDK interrupt rejected"); });
+    await expect(h.worker.interrupt()).rejects.toThrow("SDK interrupt rejected");
+    expect(h.closeCalls()).toBe(0);
+    h.worker.send("still usable");
+    expect((await h.input.next()).value.message.content).toBe("still usable");
+    expect(h.errors).toEqual([]);
+    h.worker.stop();
+    await expect(h.worker.interrupt()).rejects.toThrow("stopped");
+    expect(h.interruptCalls()).toBe(1);
+  });
+
   test("keeps one input stream alive across two results and delivers messages sequentially", async () => {
     const gate = deferred<void>();
     const seen: Record<string, unknown>[] = [];
@@ -217,8 +333,12 @@ describe("Claude SDK persistent session worker", () => {
       model: "offline-model", effort: "high",
       systemPrompt: "Private system prompt: keep off argv",
       tools: [], includePartialMessages: true, settingSources: [], strictMcpConfig: true, persistSession: false,
+      verbatimPrompts: true,
       allowedTools: ["mcp__opencodex__*"],
     });
+    expect(h.options.permissionMode).toBeUndefined();
+    expect(h.options.allowDangerouslySkipPermissions).toBeUndefined();
+    expect(Object.keys(h.options.mcpServers!)).toEqual(["opencodex"]);
     const env = h.options.env!;
     expect(env.CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS).toBe("0");
     expect(Number(env.MCP_TOOL_TIMEOUT)).toBeGreaterThanOrEqual(3_600_000);
@@ -264,7 +384,7 @@ describe("Claude SDK persistent session worker", () => {
     await expect(h.worker.updateTools([])).rejects.toThrow("stopped");
   });
 
-  test("stops its owned running native process", async () => {
+  test("interrupt preserves its owned running native process and only stop shuts it down", async () => {
     const h = await harness();
     const child = h.options.spawnClaudeCodeProcess!({
       command: process.execPath,
@@ -274,17 +394,26 @@ describe("Claude SDK persistent session worker", () => {
     await new Promise<void>(resolve => { child.stdout.once("data", () => resolve()); });
     let exited = false;
     child.once("exit", () => { exited = true; });
+    await h.worker.interrupt();
+    await Bun.sleep(0);
+    expect(exited).toBe(false);
+    expect(child.exitCode).toBeNull();
+    expect(h.closeCalls()).toBe(0);
     h.worker.stop();
     await until(() => exited);
     expect(h.errors).toEqual([]);
   });
 
-  test("the installed SDK sends the system prompt through initialize, never argv", async () => {
+  test("the installed SDK uses native interrupt control without closing input and keeps the prompt off argv", async () => {
     const prompt = "Private offline initialize marker";
     let initializePrompt: unknown;
     let argv: string[] = [];
     const messages: Record<string, unknown>[] = [];
     const errors: Error[] = [];
+    const sent: Record<string, unknown>[] = [];
+    const controls: string[] = [];
+    let rejectInterrupt = false;
+    let closed = false;
     const fakeQuery: typeof officialQuery = params => officialQuery({
       ...params,
       options: {
@@ -307,13 +436,21 @@ describe("Claude SDK persistent session worker", () => {
                   frame({ type: "control_response", response: {
                     subtype: "success", request_id: message.request_id, response: {},
                   } });
+                } else if (message.type === "control_request" && message.request.subtype === "interrupt") {
+                  controls.push(message.request.subtype);
+                  frame({ type: "control_response", response: {
+                    subtype: rejectInterrupt ? "error" : "success", request_id: message.request_id,
+                    ...(rejectInterrupt ? { error: "native interrupt refused" } : { response: { still_queued: [] } }),
+                  } });
                 } else if (message.type === "user") {
+                  sent.push(message);
                   frame({ type: "result", subtype: "success", result: "offline", session_id: "offline" });
                 }
               }
               done();
             },
             final(done) {
+              closed = true;
               stdout.end(); stderr.end();
               child.exitCode = 0;
               child.emit("exit", 0, null);
@@ -341,6 +478,17 @@ describe("Claude SDK persistent session worker", () => {
     expect(initializePrompt).toEqual([prompt]);
     expect(argv.join(" ")).not.toContain(prompt);
     expect(argv.some(arg => /^--(?:append-)?system-prompt(?:=|$)/.test(arg))).toBe(false);
+    await worker.interrupt();
+    expect(controls).toEqual(["interrupt"]);
+    expect(messages.filter(message => message.type === "result")).toHaveLength(1);
+    expect(closed).toBe(false);
+    rejectInterrupt = true;
+    await expect(worker.interrupt()).rejects.toThrow("native interrupt refused");
+    expect(closed).toBe(false);
+    worker.send("offline follow-up", { uuid: "aabbccdd-1234-4567-890a-aabbccddeeff", shouldQuery: false, priority: "next" });
+    await until(() => sent.length === 2);
+    expect(sent[1]).toEqual({ type: "user", message: { role: "user", content: "offline follow-up" }, client_composed: true,
+      parent_tool_use_id: null, uuid: "aabbccdd-1234-4567-890a-aabbccddeeff", shouldQuery: false, priority: "next" });
     expect(errors).toEqual([]);
   });
 

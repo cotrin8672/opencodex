@@ -37,11 +37,14 @@ Some adapters share another adapter's routed-tool semantics while retaining inde
 - `claude-cli` inherits the `codebuddy` stream-event and client tool-ownership contract, with
   independent session ownership in `src/adapters/claude-cli/`. An explicit own conversation ID
   selects an official SDK worker; requests without one retain the shared one-shot runner.
-  Different midstream input stops the owned worker and bootstraps full latest history; the same
-  active input reconnects to its generation. Actual started MCP calls hand off sequentially without
-  blanket concurrency annotations, preserving tool namespaces and real client results.
-  Completed text replay with a stable operation ID, staged result recovery, error metadata, and isolation
-  follow [Claude persistent sessions](../providers/claude-cli-replay.md#persistent-sessions).
+  Compatible active follow-ups interrupt and drain the generation on the same worker; pending
+  external tools instead retain a durable instruction queue, folded before inference after actual results.
+  Older request replay is resolved before touching active work. Actual started MCP calls hand off
+  sequentially without blanket concurrency annotations. Outstanding result conflicts fail closed;
+  completed historical outputs use saved authoritative results. Deduplication uses exact call IDs and
+  operation receipts; fresh IDs permit repeated user intent with the same tool name and arguments.
+  Native interrupt/drain validation limits, staged recovery, error metadata, and isolation follow
+  [Claude persistent sessions](../providers/claude-cli-replay.md#persistent-sessions).
   The CLI reads the operator's own sign-in; neither path requires or injects an API key, and the
   scoped child environment carries no inherited `ANTHROPIC_*` value. Owned stderr is drained and discarded.
   Its registry row is `authKind: "key"` with `keyOptional: true`, NOT `local`: the turn leaves the

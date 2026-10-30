@@ -382,7 +382,7 @@ describe("Claude persistent session manager (offline adversarial)", () => {
     expect(reopened.workers).toHaveLength(0);
   });
 
-  test("a cold recovery refuses a fresh ID for the action whose result was just restored", async () => {
+  test("a cold recovery refuses reuse of an already recorded tool call ID", async () => {
     const journal = new MemoryJournal();
     const h = harness(journal);
     const input = turn();
@@ -395,12 +395,12 @@ describe("Claude persistent session manager (offline adversarial)", () => {
     const reopened = harness(journal);
     const recovered = await reopened.start(withMessages(input, [...input.parsed.context.messages,
       toolAssistant([oldCall]), result(oldCall.id, "already executed")]));
-    const repeated = call(input, "toolu_fresh_id");
+    const repeated = call(input, oldCall.id);
     recovered.worker.mcp(repeated);
     await recovered.worker.blocks([repeated]);
     await recovered.done;
     expect(recovered.events.some(event => event.type.startsWith("tool_call_"))).toBe(false);
-    expect(recovered.events.at(-1)).toMatchObject({ type: "error", code: "claude_recovery_repeat_refused" });
+    expect(recovered.events.at(-1)).toMatchObject({ type: "error", code: "claude_tool_id_conflict" });
   });
 
   test("a worker crash before tool output is safely retried with a fresh worker", async () => {

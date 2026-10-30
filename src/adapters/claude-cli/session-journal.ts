@@ -17,6 +17,7 @@ export interface ClaudeToolReceipt {
 export interface ClaudeTurnReceipt {
   inputHash: string;
   requestHash?: string;
+  requestHashes?: string[];
   operationId?: string;
   historyHash?: string;
   phase: "running" | "tools" | "completed" | "interrupted" | "expired";
@@ -26,10 +27,20 @@ export interface ClaudeTurnReceipt {
   deliveryStarted?: boolean;
 }
 
+export interface ClaudeQueuedInstruction {
+  inputHash: string;
+  operationId?: string;
+  history: string[];
+  texts: string[];
+  phase: "queued" | "sent" | "completed";
+  updatedAt: number;
+}
+
 export interface ClaudeSessionSnapshot {
   version: 1;
   history: string[];
   turns: ClaudeTurnReceipt[];
+  instructions?: ClaudeQueuedInstruction[];
 }
 
 export interface ClaudeSessionJournal {
@@ -89,8 +100,14 @@ const eventSchemas = {
 } satisfies { [Type in AdapterEvent["type"]]: z.ZodType<Extract<AdapterEvent, { type: Type }>> };
 const snapshotSchema: z.ZodType<ClaudeSessionSnapshot> = z.strictObject({
   version: z.literal(1), history: z.array(hash),
+  instructions: z.array(z.strictObject({
+    inputHash: hash, operationId: hash.optional(), history: z.array(hash),
+    texts: z.array(z.string().min(1).max(MAX_RECORD_BYTES)).min(1).max(64),
+    phase: z.enum(["queued", "sent", "completed"]), updatedAt: z.number().int().nonnegative(),
+  })).max(80).optional(),
   turns: z.array(z.strictObject({
     inputHash: hash, requestHash: hash.optional(), operationId: hash.optional(), historyHash: hash.optional(), phase: z.enum(["running", "tools", "completed", "interrupted", "expired"]),
+    requestHashes: z.array(hash).max(64).optional(),
     events: z.array(z.union(Object.values(eventSchemas))),
     calls: z.array(z.strictObject({
       id: z.string().min(1), name: z.string().min(1), arguments: z.string(),

@@ -1514,21 +1514,30 @@ CLI headlessly, retaining a native conversation for clients that supply their ow
   thread IDs and prompt-cache keys do not select or share one. Without an own identity, requests
   retain isolated one-shot compatibility. A cold start or history rebase uses the full stable text
   projection, trimmed only at message boundaries; later user turns use Claude's native context.
-  Different input during generation stops the old owned worker and starts a fresh one from the full
-  latest client history, including intervening instructions. Conversation IDs remain isolated by
+  A compatible follow-up during generation uses native SDK interruption, waits for the old
+  generation's terminal result, and continues on the same worker. Configuration changes and history
+  rebases require a fresh bootstrap. Conversation IDs remain isolated by
   proxy home, client identity, provider/destination, and conversation versus compaction purpose.
   Claude Code controls prompt-cache breakpoints, so cache savings are not guaranteed.
+- **Follow-ups while tools run:** user instructions are saved in a durable queue while external tool
+  results are pending. They do not start inference or substitute for actual results. Once the client's
+  actual results arrive and are committed, the queued instructions are folded into the context in
+  acceptance order before the next inference. Keep returning results under their original call IDs.
 - **Tool ownership:** Codex, Pi, or another external client owns approval, sandboxing and execution.
   In persistent mode, actual started MCP calls hand off sequentially without marking tools parallel.
   Each call waits for the client's real result before Claude continues. Return every result under
-  its original call ID and preserve its namespace, content and error flag.
+  its original call ID and preserve its namespace, content and error flag while it is outstanding.
+  Deduplication uses exact call IDs and stable operation receipts. A new action with a fresh call ID
+  can legitimately repeat the same tool name and arguments.
   One-shot compatibility ends the CLI after capturing a tool batch and
   replays the client's results in the next request.
 - **Disconnects and retries:** in persistent mode, the same active input can reconnect for 30 seconds
   after an HTTP disconnect. Idle workers stop after 30 minutes, with at most 16 live workers.
   Completed text responses replay without new model usage only for matching input with the same stable
   `idempotency-key` header or `client_metadata.turn_id`; identical text or a conversation ID alone
-  does not authorize completed replay. Session errors retain status, code, retryability and available
+  does not authorize completed replay. Replaying an older request, or refusing its expired receipt,
+  is handled before interrupting, stopping, or replacing a newer active generation or its response.
+  Session errors retain status, code, retryability and available
   usage/error-type metadata. After a proxy restart, a fresh worker uses client history and saved results;
   native SDK session resume is not guaranteed.
 - **Uncertain tool delivery:** in persistent mode, receipts and a delivery marker are committed to
@@ -1536,13 +1545,18 @@ CLI headlessly, retaining a native conversation for clients that supply their ow
   on reconnect only if delivery never started; issued actions are not automatically reissued.
   Incoming results are staged and committed before continuation. Saved results omitted from history
   are restored only beside their unique matching original assistant calls, preserving namespaces;
-  a missing or ambiguous call, a conflict, or a failed commit fails closed. Uncertain delivery produces
+  a missing or ambiguous call needed for restoration, a changed call identity, or a failed commit
+  fails closed. Outstanding results remain strict: competing content or error flags produce
+  `claude_tool_result_conflict`, including a placeholder alongside an actual result. A placeholder's
+  wording does not prove whether an action ran. For completed receipts with saved results, later
+  historical output is normalized to the saved authoritative content and error flag, including
+  shortened output or placeholder/real-output duplicates; the journal's receipt stays unchanged.
+  Uncertain delivery produces
   `claude_tool_delivery_uncertain` (HTTP 409). Missing results produce
-  `claude_tool_results_pending` (a 400/409 client error), and changed recorded results produce
-  `claude_tool_result_conflict`. An issued host action with an unknown result still needs its original
+  `claude_tool_results_pending` (a 400/409 client error). An issued host action with an unknown result still needs its actual
   result before continuation, including after input changes. Verify whether it ran; do not automatically
   execute it again. Delivery and execution have no exactly-once guarantee.
-  The journal under the OpenCodex home contains private tool arguments and outputs.
+  The journal under the OpenCodex home contains private tool arguments, outputs, and queued user instructions.
 - **Subscription limits:** before each request OpenCodex asks Anthropic's usage endpoint, with the
   CLI's own sign-in read in memory, whether the plan's 5-hour, weekly or model-specific window is
   full. An exhausted plan is refused locally with HTTP 429 `claude_subscription_cooldown` and a

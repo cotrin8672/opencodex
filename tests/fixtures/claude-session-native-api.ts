@@ -66,7 +66,10 @@ function response(body: NativeRequest, reply: NativeReply, ordinal: number): Res
 }
 
 /** Real SDK + packaged native scheduler; only Anthropic inference is scripted. */
-export function nativeSession(replies: NativeReply[]) {
+export function nativeSession(replies: NativeReply[], options: {
+  journal?: MemoryJournal;
+  interruptWait?: Promise<void>;
+} = {}) {
   assert(nativeBinary, "The packaged native Claude executable is absent");
   assert(isTestHomeGuardArmed() && process.env.OCX_TEST_PRELOAD_PID === String(process.pid), "Load tests/preload.ts from the repo CWD");
   assert.equal(realpathSync(process.cwd()), realpathSync(repoRoot()), "Run native tests from the repository CWD");
@@ -82,6 +85,9 @@ export function nativeSession(replies: NativeReply[]) {
   const resolved: string[] = [];
   const active = new Set<string>();
   let maxActive = 0;
+  let interrupts = 0;
+  let acknowledgedInterrupts = 0;
+  const journal = options.journal ?? new MemoryJournal();
   const shutdown = gate();
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
     const url = new URL(req.url);
@@ -125,12 +131,12 @@ export function nativeSession(replies: NativeReply[]) {
     HOMEDRIVE: home.slice(0, 2), HOMEPATH: home.slice(2),
   });
   const manager = new ClaudeSessionManager({
-    journal: new MemoryJournal(), timeoutMs: 15_000, reconnectGraceMs: 30_000,
-    createWorker: options => createClaudeSessionWorker({ ...options,
+    journal, timeoutMs: 15_000, reconnectGraceMs: 30_000,
+    createWorker: workerOptions => createClaudeSessionWorker({ ...workerOptions,
       query: params => {
         assert.deepEqual(params.options?.tools, []);
         assert.deepEqual(params.options?.settingSources, []);
-        return query({ ...params, options: { ...params.options, cwd: home,
+        const session = query({ ...params, options: { ...params.options, cwd: home,
           spawnClaudeCodeProcess: launch => {
             assert.equal(launch.command, nativeBinary);
             const child = params.options!.spawnClaudeCodeProcess!(launch);
@@ -138,13 +144,22 @@ export function nativeSession(replies: NativeReply[]) {
             return child;
           },
         } });
+        const interrupt = session.interrupt.bind(session);
+        session.interrupt = async () => {
+          interrupts++;
+          await interrupt();
+          acknowledgedInterrupts++;
+          // Hold only the owner's return; the real SDK control and native terminal result still run.
+          if (options.interruptWait) await Promise.race([options.interruptWait, shutdown.wait]);
+        };
+        return session;
       },
       onToolCall: async (call, signal) => {
         requested.push(call.id);
         active.add(call.id);
         maxActive = Math.max(maxActive, active.size);
         try {
-          const result = await options.onToolCall(call, signal);
+          const result = await workerOptions.onToolCall(call, signal);
           resolved.push(call.id);
           return result;
         } finally { active.delete(call.id); }
@@ -156,7 +171,10 @@ export function nativeSession(replies: NativeReply[]) {
   input.env = env;
   input.parsed.modelId = "claude-opus-4-6";
   return {
-    input, requests, replied, unexpected, children, requested, resolved, get maxActive() { return maxActive; },
+    input, requests, replied, unexpected, children, requested, resolved, manager, journal,
+    get maxActive() { return maxActive; },
+    get interrupts() { return interrupts; },
+    get acknowledgedInterrupts() { return acknowledgedInterrupts; },
     run(input: ClaudePersistentTurn) {
       const events: AdapterEvent[] = [];
       const done = manager.run(input, event => { events.push(event); });
