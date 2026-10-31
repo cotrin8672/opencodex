@@ -1541,6 +1541,18 @@ CLI headlessly, retaining a native conversation for clients that supply their ow
   replays the client's results in the next request.
 - **Disconnects and retries:** in persistent mode, the same active input can reconnect for 30 seconds
   after an HTTP disconnect. Idle workers stop after 30 minutes, with at most 16 live workers.
+  Session preparation has a 30-second deadline, including native history recovery, worker startup,
+  tool-catalog updates and input writes. A timeout returns `claude_session_setup_timeout` instead of
+  leaving later requests queued indefinitely. Cancelling preparation releases its queue entry;
+  an established generation retains the reconnect grace above. A replacement process waits for
+  confirmed exit of its predecessor, including workers that finish starting after cancellation.
+  Generation times out after five minutes without current-turn native output progress; continuing
+  output refreshes this deadline, while proxy heartbeats and stale turn frames do not. Existing
+  external tool calls still require their original results and are never automatically reissued.
+  If additional instructions are queued while tool results are missing, their response returns
+  `claude_tool_results_pending` after 30 seconds instead of waiting forever. The instructions stay
+  saved and the original tool remains pending; returning its actual result continues on the same
+  live worker. This applies to instructions from a subagent tab or its parent agent alike.
   Completed text responses replay without new model usage only for matching input with the same stable
   `idempotency-key` header or `client_metadata.turn_id`; identical text or a conversation ID alone
   does not authorize completed replay. Replaying an older request, or refusing its expired receipt,

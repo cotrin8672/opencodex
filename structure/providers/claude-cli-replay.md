@@ -37,14 +37,23 @@ Incoming results are staged in a detached snapshot and committed before in-memor
 | Manager error | Status | Recovery |
 | --- | --- | --- |
 | `claude_tool_delivery_uncertain` | 409 | Verify whether the external action ran and return its original results; do not reissue the batch. |
-| `claude_tool_results_pending` | 409 | Return every outstanding result under its existing call ID; queued user instructions do not settle tool execution. |
+| `claude_tool_results_pending` | 409 | Return every outstanding result under its existing call ID; queued user instructions do not settle tool execution. A queued follow-up returns this non-retryable terminal after 30 seconds without results, preserving its instructions and the native MCP wait. |
 | `claude_tool_result_conflict` | 409 | Resolve competing outstanding results while preserving any committed content and error bit; completed historical outputs use the saved result. |
 | `claude_recovery_history_missing` | 409 | Supply the unambiguous original assistant call so its saved result can be restored. |
 | `claude_journal_write_failed` | 503 | Tool exposure is refused when its receipt or delivery marker cannot be committed. |
+| `claude_session_setup_timeout` | 504 | Preparation exceeded 30 seconds; retry after the previous process has stopped. Saved tool results and delivery markers remain authoritative. |
+| `claude_session_timeout` | 504 | No accepted native generation progress for five minutes; a retry plans safe native recovery. |
+| `claude_worker_shutdown_failed` | 503 | Process exit could not be verified; replacement remains fenced to prevent concurrent execution. |
 
 External execution can happen before a connection fails. There is no exactly-once delivery or execution guarantee: an issued host action with an unknown result requires verification and its original result, and cannot be automatically replayed. Session errors preserve status, code, retryability and available usage/error-type metadata.
 
 ## Reconnect and recovery
+
+Preparation has one 30-second deadline covering its queue predecessor, owned-worker shutdown, native history planning, worker creation, tool-catalog updates, and input writes. Request cancellation and manager shutdown unwind these waits. Cancelled queue entries cannot let later requests overtake the preceding owner. Native planning checks cancellation after each SDK read/fork before further work; late worker creation retains an ownership fence until that worker actually stops. Unconfirmed process exit refuses replacement instead of launching a second process. Generation failure also terminates preparation so an error cannot remain trapped before consumer attachment.
+
+Generation uses a five-minute inactivity deadline refreshed by current-turn native assistant/result and content stream events, not synthetic heartbeats or stale turn frames. External tool-result waiting remains separate. `tests/providers/claude-cli-session-setup.test.ts` and `tests/providers/claude-cli-session-setup-http.test.ts` cover bounded recovery, cancellation, late completions, serialized ownership, saved tool results and SSE/buffered terminal delivery.
+
+A follow-up queued behind outstanding external results has a separate 30-second response wait. Expiry records an interrupted receipt with `claude_tool_results_pending` (409, non-retryable) and settles its consumer without stopping the native worker, clearing pending MCP calls, discarding queued instructions or repeating any action. Actual results can still resume the same worker; repeated automatic retries are not a substitute for the original results.
 
 An HTTP disconnect leaves the existing generation available for the same active input to reconnect for 30 seconds. A different compatible follow-up uses the same-worker interrupt/drain or pending-tool instruction queue described above; a history rebase or configuration change replaces the worker through native history planning. Outstanding issued actions still require their actual results before inference continues. Idle workers stop after 30 minutes; the manager allows at most 16 live workers, evicting an idle one or returning `claude_worker_capacity` (503) when all are busy.
 

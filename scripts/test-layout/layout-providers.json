@@ -3,6 +3,8 @@
   "claude-cli-session-manager.test.ts": "providers",
   "claude-cli-session-worker.test.ts": "providers",
   "claude-cli-session-http.test.ts": "providers",
+  "claude-cli-session-setup.test.ts": "providers",
+  "claude-cli-session-setup-http.test.ts": "providers",
   "claude-cli-session-context.test.ts": "providers",
   "claude-cli-session-recovery.test.ts": "providers",
   "claude-cli-session-retention.test.ts": "providers",

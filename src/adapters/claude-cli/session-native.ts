@@ -57,7 +57,9 @@ function safeBoundaries(messages: SessionMessage[]): Set<string> {
 export async function planClaudeNativeSession(
   input: { record?: ClaudeNativeSession; messages: OcxMessage[]; identity: string; directory: string },
   io: ClaudeNativeSessionIO = sdkIO,
+  signal?: AbortSignal,
 ): Promise<{ native: ClaudeNativeSession; start: number; resume?: string }> {
+  signal?.throwIfAborted();
   const { messages, identity, directory } = input;
   const fresh = (): { native: ClaudeNativeSession; start: number } => ({
     native: claudeNativeSessionSchema.parse({ sessionId: randomUUID(), directory, identity, history: [], checkpoints: [], dirty: false }), start: 0,
@@ -72,6 +74,7 @@ export async function planClaudeNativeSession(
   if (!eligible.length) return fresh();
   try {
     const source = await io.getSessionMessages(record.sessionId, { dir: directory });
+    signal?.throwIfAborted();
     if (!source.length) return fresh();
     verifyMessages(source, record.sessionId);
     const safe = safeBoundaries(source);
@@ -84,8 +87,10 @@ export async function planClaudeNativeSession(
       return { native: structuredClone(record), start, resume: record.sessionId };
     }
     const { sessionId } = await io.forkSession(record.sessionId, { dir: directory, upToMessageId: checkpoint.messageId });
+    signal?.throwIfAborted();
     if (!uuid.test(sessionId) || sessionId === record.sessionId) refused();
     const fork = await io.getSessionMessages(sessionId, { dir: directory });
+    signal?.throwIfAborted();
     verifyMessages(fork, sessionId);
     if (fork.length !== end + 1) refused();
     const mapping = new Map<string, string>();
@@ -105,6 +110,7 @@ export async function planClaudeNativeSession(
     });
     return { native: { ...record, sessionId, history: record.history.slice(0, checkpoint.length), checkpoints, dirty: false }, start, resume: sessionId };
   } catch (error) {
+    signal?.throwIfAborted();
     if (error instanceof ClaudeSessionError) throw error;
     throw new ClaudeSessionError("Claude native history is unavailable.", "claude_native_history_unavailable", 503, true);
   }

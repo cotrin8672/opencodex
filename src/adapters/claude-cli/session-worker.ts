@@ -4,6 +4,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import type { CodingAgentMcpTool } from "../coding-agent/mcp-server";
 import { CodingAgentProtocolError } from "../coding-agent/protocol";
+import { ClaudeSessionError } from "./session-errors";
 
 export interface ClaudeWorkerToolCall {
   id: string;
@@ -261,6 +262,8 @@ export async function createClaudeSessionWorker(options: ClaudeWorkerOptions): P
   } catch {
     const error = new Error("Claude CLI session launch failed");
     fail(error);
+    try { await stop(); }
+    catch { throw new ClaudeSessionError("Claude CLI launch cleanup could not confirm process exit.", "claude_worker_shutdown_failed", 503, true); }
     throw error;
   }
 

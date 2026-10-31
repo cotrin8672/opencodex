@@ -16,6 +16,7 @@ import { claudeHistoryBoundary, claudeInstructionContinuation, extractClaudeInst
 import { planClaudeNativeSession, type ClaudeNativeSessionIO } from "./session-native";
 import { createClaudeSdkStreamState, mapClaudeSdkMessage, releaseClaudeSdkBlocks, type ClaudeSdkStreamState } from "./session-events";
 import { ClaudeSessionError } from "./session-errors";
+import { ClaudeSessionSetup } from "./session-setup";
 import type { ClaudeSessionWorker, ClaudeWorkerOptions, ClaudeWorkerToolCall } from "./session-worker";
 
 export { ClaudeSessionError } from "./session-errors";
@@ -39,6 +40,7 @@ export interface ClaudeSessionManagerDeps {
   nativeIO?: ClaudeNativeSessionIO;
   nativeDirectory?: string;
   timeoutMs?: number;
+  setupTimeoutMs?: number;
   reconnectGraceMs?: number;
   idleMs?: number;
 }
@@ -71,6 +73,7 @@ type Leg = {
   done: Promise<void>;
   settle: () => void;
   timer?: ReturnType<typeof setTimeout>;
+  setup?: ClaudeSessionSetup;
   release: () => void;
 };
 type Session = {
@@ -95,6 +98,7 @@ export class ClaudeSessionManager {
   private readonly sessions = new Map<string, Session>();
   private readonly closingWorkers = new Map<string, Promise<void>>();
   private readonly journal: ClaudeSessionJournal;
+  private readonly shutdown = new AbortController();
   private closed = false;
   private closing?: Promise<void>;
 
@@ -120,15 +124,18 @@ export class ClaudeSessionManager {
     }
     const predecessor = session.setup;
     let unlock!: () => void;
-    session.setup = new Promise(resolve => { unlock = resolve; });
+    const gate = new Promise<void>(resolve => { unlock = resolve; });
+    // A cancelled queued request must not let its successor overtake the current owner.
+    session.setup = predecessor.then(() => gate);
     session.busy++;
-    await predecessor;
-    if (session.idle) clearTimeout(session.idle);
+    const setup = new ClaudeSessionSetup(this.deps.setupTimeoutMs ?? 30_000, input.incoming.abortSignal, this.shutdown.signal);
     let leg: Leg | undefined;
     let consumer: Consumer | undefined;
     let onAbort: (() => void) | undefined;
     let cancelled: Promise<void> | undefined;
     try {
+      await setup.wait(predecessor, "waiting for the preceding request");
+      if (session.idle) clearTimeout(session.idle);
       if (this.closed) throw new ClaudeSessionError("Claude sessions are shutting down.", "claude_session_shutdown", 503);
       if (input.incoming.abortSignal?.aborted) return;
       let history = claudeHistory(input.parsed.context.messages);
@@ -197,7 +204,7 @@ export class ClaudeSessionManager {
           let steered = false;
           if (current && !current.finished && !current.waitingResults) {
             if (sameWorker && extending && claudeInstructionContinuation(restored, session.snapshot.history, this.assistant(current.receipt), new Set())) {
-              await this.interruptGeneration(session);
+              await this.interruptGeneration(session, setup);
               steered = true;
             } else this.fail(session, new ClaudeSessionError("A newer input replaced this Claude generation.", "claude_turn_superseded", 499));
           } else if (current?.waitingResults && !current.finished) {
@@ -206,10 +213,19 @@ export class ClaudeSessionManager {
           if (missingResults) {
             if (!accepted.length && newTexts.length === 0) throw new ClaudeSessionError("Claude is waiting for the existing tool results.", "claude_tool_results_pending");
             if (previous) session.snapshot.turns.splice(session.snapshot.turns.indexOf(previous), 1);
-            leg = this.newLeg(session, input, inputHash, historyHash, operationId, requestHash);
+            leg = this.newLeg(session, input, inputHash, historyHash, operationId, requestHash, setup);
             leg.waitingResults = true;
             leg.nativeId = session.nativeId ?? leg.nativeId;
             if (leg.timer) clearTimeout(leg.timer);
+            const waiting = leg;
+            leg.timer = setTimeout(() => {
+              if (session.active !== waiting || waiting.finished || !waiting.waitingResults) return;
+              try {
+                this.finishInterrupted(session, { type: "error", status: 409, code: "claude_tool_results_pending", retryable: false,
+                  message: "The additional instructions were saved, but the existing external tool results have not arrived. Return the original tool results to continue; do not execute those calls again." });
+              } catch { this.fail(session, new ClaudeSessionError("The waiting response could not be committed.", "claude_journal_write_failed", 503)); }
+            }, this.deps.setupTimeoutMs ?? 30_000);
+            leg.timer.unref?.();
             leg.receipt.requestHashes = [...new Set([requestHash, ...accepted.map(entry => entry.inputHash)])].slice(-64);
             leg.instructionIds = accepted.map(entry => entry.inputHash);
             leg.receipt.events.push({ type: "heartbeat", replayUnsafe: true });
@@ -226,13 +242,13 @@ export class ClaudeSessionManager {
             let resume: string | undefined;
             const directory = resolve(this.deps.nativeDirectory ?? getConfigDir());
             if (!nativeContinuation) {
-              await this.stopWorker(session);
-              const plan = await planClaudeNativeSession({ record: session.snapshot.native, messages: restored, identity, directory }, this.deps.nativeIO);
+              await setup.wait(this.stopWorker(session), "stopping the preceding worker");
+              const plan = await setup.wait(planClaudeNativeSession({ record: session.snapshot.native, messages: restored, identity, directory }, this.deps.nativeIO, setup.signal), "restoring native history");
               session.snapshot.native = plan.native; start = plan.start; resume = plan.resume;
             }
             if (session.snapshot.turns.length >= 4096 && !previous) throw new ClaudeSessionError("This conversation reached its receipt limit; start a new conversation.", "claude_session_history_limit", 413);
             if (previous) session.snapshot.turns.splice(session.snapshot.turns.indexOf(previous), 1);
-            leg = this.newLeg(session, input, inputHash, historyHash, operationId, requestHash);
+            leg = this.newLeg(session, input, inputHash, historyHash, operationId, requestHash, setup);
             leg.receipt.requestHashes = [...new Set([requestHash, ...accepted.map(entry => entry.inputHash)])].slice(-64);
             leg.instructionIds = accepted.map(entry => entry.inputHash);
             if (nativeContinuation && pendingTurns.length) leg.nativeId = session.nativeId ?? leg.nativeId;
@@ -241,10 +257,10 @@ export class ClaudeSessionManager {
             if (session.snapshot.native) session.snapshot.native.dirty = true;
             this.save(session);
             if (!session.worker) {
-              const createWorker = this.deps.createWorker ?? (await import("./session-worker")).createClaudeSessionWorker;
+              const createWorker = this.deps.createWorker ?? (await setup.wait(import("./session-worker"), "loading the Claude worker")).createClaudeSessionWorker;
               const owner = session;
               const epoch = session.epoch;
-              const worker = await createWorker({
+              const starting = createWorker({
                 binary: input.binary, model: input.parsed.modelId, env: input.env, systemPrompt: input.systemPrompt,
                 effort: input.effort, tools: input.bridge.tools, cwd: directory, persistSession: true,
                 ...(resume ? { resume } : { sessionId: session.snapshot.native!.sessionId }),
@@ -253,14 +269,28 @@ export class ClaudeSessionManager {
                   : Promise.reject(new ClaudeSessionError("The Claude worker was replaced.", "claude_turn_superseded", 499)),
                 onError: error => { if (owner.epoch === epoch) this.fail(owner, error); },
               });
-              if (leg.finished || this.closed) await worker.stop();
-              else {
-                session.worker = worker;
-                session.configuration = configuration;
-                session.catalog = catalog;
-              }
+              let adopted = false;
+              let decide!: () => void;
+              const decision = new Promise<void>(resolve => { decide = resolve; });
+              // The fence ends only after atomic adoption or verified orphan cleanup.
+              this.trackClosing(session.scope, starting.then(async worker => {
+                await decision;
+                if (!adopted) await worker.stop();
+              }, error => {
+                if (error instanceof ClaudeSessionError && error.code === "claude_worker_shutdown_failed") throw error;
+              }));
+              try {
+                const worker = await setup.wait(starting, "starting the Claude worker");
+                setup.check();
+                if (!leg.finished && !this.closed && owner.epoch === epoch) {
+                  session.worker = worker;
+                  session.configuration = configuration;
+                  session.catalog = catalog;
+                  adopted = true;
+                }
+              } finally { decide(); }
             } else if (session.catalog !== catalog) {
-              await session.worker.updateTools(input.bridge.tools);
+              await setup.wait(session.worker.updateTools(input.bridge.tools), "updating the tool catalog");
               session.catalog = catalog;
             }
             if (input.incoming.abortSignal?.aborted) {
@@ -272,7 +302,7 @@ export class ClaudeSessionManager {
               if (!leg.waitingTools) this.admit(leg);
               if (nativeContinuation && pendingTurns.length) {
                 for (const instruction of accepted.filter(entry => entry.phase === "queued")) {
-                  for (const text of instruction.texts) await session.worker.send(text, { shouldQuery: false, uuid: crypto.randomUUID() });
+                  for (const text of instruction.texts) await setup.wait(session.worker.send(text, { shouldQuery: false, uuid: crypto.randomUUID() }), "writing a queued instruction");
                 }
               }
               for (const instruction of accepted) instruction.phase = "sent";
@@ -290,7 +320,7 @@ export class ClaudeSessionManager {
                 const text = steered && newTexts.length ? newTexts.join("\n\n")
                   : buildClaudeSessionCatchUp(input.parsed, input.provider, input.bridge, start);
                 session.nativeId = leg.nativeId;
-                await session.worker.send(text, { uuid: leg.nativeId });
+                await setup.wait(session.worker.send(text, { uuid: leg.nativeId }), "writing the Claude input");
               }
             }
           }
@@ -312,8 +342,12 @@ export class ClaudeSessionManager {
       this.publish(session);
     } catch (error) {
       if (leg && !leg.finished) this.fail(session, error instanceof Error ? error : new Error(String(error)));
+      if (input.incoming.abortSignal?.aborted && error instanceof ClaudeSessionError && error.code === "claude_request_cancelled") return;
       throw error;
-    } finally { session.busy--; unlock(); if (!leg) this.armIdle(session); }
+    } finally {
+      if (leg?.setup === setup) leg.setup = undefined;
+      setup.dispose(); session.busy--; unlock(); this.armIdle(session);
+    }
     if (!leg || !consumer) return;
     try {
       await Promise.race([leg.done, cancelled]);
@@ -353,21 +387,21 @@ export class ClaudeSessionManager {
     this.save(session, draft);
   }
 
-  private async interruptGeneration(session: Session): Promise<void> {
+  private async interruptGeneration(session: Session, setup: ClaudeSessionSetup): Promise<void> {
     const leg = session.active!;
     const worker = session.worker!;
     leg.interrupting = true;
     let timer!: ReturnType<typeof setTimeout>;
     try {
-      await Promise.race([Promise.all([worker.interrupt(), leg.done]), new Promise<never>((_, reject) => {
+      await setup.wait(Promise.race([Promise.all([worker.interrupt(), leg.done]), new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new ClaudeSessionError("Claude did not confirm the interrupted turn boundary.", "claude_interrupt_unconfirmed", 504, true)), 10_000);
-      })]);
+      })]), "interrupting the preceding generation");
     } catch (error) {
       this.fail(session, error instanceof Error ? error : new Error(String(error))); throw error;
     } finally { clearTimeout(timer); }
   }
 
-  private finishInterrupted(session: Session): void {
+  private finishInterrupted(session: Session, terminal?: AdapterEvent): void {
     const leg = session.active!;
     if (leg.interrupting) {
       session.queued = [];
@@ -382,7 +416,7 @@ export class ClaudeSessionManager {
     leg.receipt.calls = [];
     leg.receipt.phase = "interrupted";
     leg.receipt.updatedAt = Date.now();
-    leg.receipt.events.push({ type: "incomplete", reason: "superseded", endTurn: false, retryable: false,
+    leg.receipt.events.push(terminal ?? { type: "incomplete", reason: "superseded", endTurn: false, retryable: false,
       ...(leg.state.partialUsage ? { usage: leg.state.partialUsage } : {}) });
     this.save(session);
     this.finishLeg(session, leg);
@@ -399,7 +433,7 @@ export class ClaudeSessionManager {
     leg.settle();
   }
 
-  private newLeg(session: Session, input: ClaudePersistentTurn, inputHash: string, historyHash: string, operationId?: string, requestHash = inputHash): Leg {
+  private newLeg(session: Session, input: ClaudePersistentTurn, inputHash: string, historyHash: string, operationId?: string, requestHash = inputHash, setup?: ClaudeSessionSetup): Leg {
     let settle!: () => void;
     const receipt: ClaudeTurnReceipt = { inputHash, historyHash, ...(operationId ? { operationId } : {}),
       ...(requestHash !== inputHash ? { requestHash } : {}), phase: "running", events: [], calls: [], updatedAt: Date.now() };
@@ -407,16 +441,22 @@ export class ClaudeSessionManager {
       input, receipt, state: createClaudeSdkStreamState({ translatorBudget: createTranslatorBudget(),
         toolBridgeNames: input.bridge.emittedNameMap, maxToolBlockStarts: CODEBUDDY_TOOL_LIMITS.maxTurnToolCalls }),
       nativeNames: new Map(), mcpIds: new Set(), buffered: false, finished: false, bytes: 0,
-      nativeId: crypto.randomUUID(), instructionIds: [],
+      nativeId: crypto.randomUUID(), instructionIds: [], setup,
       done: new Promise(resolve => { settle = resolve; }), settle: () => settle(), release: () => {},
     };
     session.snapshot.turns.push(receipt);
     session.active = leg;
+    this.refreshGenerationTimeout(session, leg);
+    return leg;
+  }
+
+  private refreshGenerationTimeout(session: Session, leg: Leg): void {
+    if (leg.finished || leg.waitingResults) return;
+    if (leg.timer) clearTimeout(leg.timer);
     leg.timer = setTimeout(() => {
       if (session.active === leg && !leg.finished) this.fail(session, new ClaudeSessionError("Claude generation timed out.", "claude_session_timeout", 504, true));
     }, this.deps.timeoutMs ?? 300_000);
     leg.timer.unref?.();
-    return leg;
   }
 
   private admit(leg: Leg): void {
@@ -440,6 +480,10 @@ export class ClaudeSessionManager {
     if (!leg || leg.finished) return;
     if ("user_message_uuid" in message && typeof message.user_message_uuid === "string" && message.user_message_uuid !== leg.nativeId
       && !("user_message_uuids" in message && message.user_message_uuids?.includes(leg.nativeId))) return;
+    if (message.type === "assistant" || message.type === "result" || message.type === "stream_event"
+      && ["message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"].includes(message.event.type)) {
+      this.refreshGenerationTimeout(session, leg);
+    }
     if (leg.interrupting) {
       if (message.type === "result") {
         leg.state.partialUsage = usageFromResult(message) ?? leg.state.partialUsage;
@@ -700,6 +744,7 @@ export class ClaudeSessionManager {
 
   private fail(session: Session, error: Error): void {
     const leg = session.active;
+    if (leg && !leg.finished) leg.setup?.abort(error);
     this.stopWorker(session);
     if (!leg || leg.finished) return;
     if (leg.timer) clearTimeout(leg.timer);
@@ -731,19 +776,22 @@ export class ClaudeSessionManager {
     session.epoch++;
     session.queued = [];
     if (worker) {
-      const previous = this.closingWorkers.get(session.scope);
       let stopped: Promise<void>;
       try { stopped = Promise.resolve(worker.stop()); }
       catch (error) { stopped = Promise.reject(error); }
-      const closing = Promise.all([previous, stopped]).then(() => {});
-      this.closingWorkers.set(session.scope, closing);
-      void closing.then(() => {
-        if (this.closingWorkers.get(session.scope) === closing) this.closingWorkers.delete(session.scope);
-      }, () => {});
+      this.trackClosing(session.scope, stopped);
     }
     for (const pending of session.pending.values()) pending.reject(new Error("The Claude worker stopped."));
     session.pending.clear();
     return this.closingWorkers.get(session.scope) ?? Promise.resolve();
+  }
+
+  private trackClosing(scope: string, stopped: Promise<void>): void {
+    const closing = Promise.all([this.closingWorkers.get(scope), stopped]).then(() => {});
+    this.closingWorkers.set(scope, closing);
+    void closing.then(() => {
+      if (this.closingWorkers.get(scope) === closing) this.closingWorkers.delete(scope);
+    }, () => {});
   }
 
   private armIdle(session: Session): void {
@@ -762,15 +810,17 @@ export class ClaudeSessionManager {
   close(): Promise<void> {
     if (this.closing) return this.closing;
     this.closed = true;
+    this.shutdown.abort();
     for (const session of this.sessions.values()) {
       if (session.idle) clearTimeout(session.idle);
       this.fail(session, new ClaudeSessionError("The Claude session manager is shutting down.", "claude_session_shutdown", 503, true));
     }
     this.closing = (async () => {
+      const drain = new ClaudeSessionSetup(this.deps.setupTimeoutMs ?? 30_000);
       try {
-        await Promise.all([...this.sessions.values()].map(session => session.setup));
-        await Promise.all(this.closingWorkers.values());
-      } finally { this.sessions.clear(); this.journal.close(); }
+        await drain.wait(Promise.all([...this.sessions.values()].map(session => session.setup)), "draining session setup");
+        await drain.wait(Promise.all(this.closingWorkers.values()), "stopping Claude workers");
+      } finally { drain.dispose(); this.sessions.clear(); this.journal.close(); }
     })();
     void this.closing.catch(() => {});
     return this.closing;

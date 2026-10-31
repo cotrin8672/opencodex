@@ -182,4 +182,138 @@ describe.skipIf(!nativeBinary)("Claude sessions through SDK 0.3.314 and local na
       expect(h.unexpected).toEqual([]);
     } finally { await h.close(); }
   }, 45_000);
+
+  test.each(["same-input", "new-input"] as const)("generation timeout forks safely and recovers with %s", async mode => {
+    const held = gate();
+    const h = nativeSession([
+      { content: [text("CLEAN_A")] },
+      { content: [text("NEVER_DELIVERED_B")], wait: held.wait },
+      { content: [text("RECOVERED")] },
+    ], { nativePersistence: true });
+    const identified = (messages: OcxMessage[], operation: string) => {
+      const next = withMessages(h.input, messages);
+      next.incoming = { ...next.incoming, headers: new Headers(next.incoming.headers) };
+      next.incoming.headers.set("idempotency-key", operation);
+      return next;
+    };
+    try {
+      const initial = [user("A initial question")];
+      const seed = h.run(identified(initial, "A"));
+      await seed.done;
+      final(seed.events, "CLEAN_A");
+      const priorNative = h.journal.load(h.input.scope)!.native!;
+      const checkpoint = priorNative.checkpoints.at(-1)!;
+      expect(priorNative.dirty).toBe(false);
+      expect(checkpoint).toBeDefined();
+
+      (h.manager as any).deps.timeoutMs = 300;
+      const history = [...initial, assistant("CLEAN_A"), user("B slow request")];
+      const slowInput = identified(history, "B");
+      const slow = h.run(slowInput);
+      await nativeUntil(() => h.requests.length === 2, "B dispatches before its inactivity timeout", 2_000);
+      await nativeUntil(() => slow.events.at(-1)?.type === "error", "B reaches its terminal timeout", 2_000);
+      await slow.done;
+      expect(slow.events.at(-1)).toMatchObject({ type: "error", code: "claude_session_timeout", status: 504, retryable: true });
+      expect(h.journal.load(h.input.scope)!.native!.dirty).toBe(true);
+      expect(h.requests).toHaveLength(2);
+
+      (h.manager as any).deps.timeoutMs = 8_000;
+      const retryInput = mode === "same-input" ? slowInput : identified([...history, user("C recover and answer")], "C");
+      const retry = h.run(retryInput);
+      await nativeUntil(() => retry.events.some(event => event.type === "done" || event.type === "error"), "native retry terminates", 10_000);
+      await retry.done;
+      final(retry.events, "RECOVERED");
+      expect(h.children).toHaveLength(2);
+      await nativeUntil(() => h.children[0]!.exitCode !== null || h.children[0]!.signalCode !== null, "timed-out child exits");
+      expect(h.requests).toHaveLength(3);
+      const recoveredNative = h.journal.load(h.input.scope)!.native!;
+      expect(recoveredNative.sessionId).not.toBe(priorNative.sessionId);
+      expect(recoveredNative.dirty).toBe(false);
+      const remapped = recoveredNative.checkpoints.find(point => point.length === checkpoint.length);
+      expect(remapped).toBeDefined();
+      expect(remapped!.messageId).not.toBe(checkpoint.messageId);
+      const bootstrap = JSON.stringify(h.requests[2]!.messages);
+      for (const item of ["A initial question", "CLEAN_A", "B slow request"]) expect(bootstrap).toContain(item);
+      if (mode === "new-input") expect(bootstrap).toContain("C recover and answer");
+      expect(bootstrap).not.toContain("NEVER_DELIVERED_B");
+
+      const beforeLateReply = structuredClone(retry.events);
+      held.release();
+      await nativeUntil(() => h.replied.includes(2), "late B API response is released");
+      expect(retry.events).toEqual(beforeLateReply);
+      expect(output([...slow.events, ...retry.events])).not.toContain("NEVER_DELIVERED_B");
+      const replay = h.run(retryInput);
+      await replay.done;
+      final(replay.events, "RECOVERED");
+      expect(h.requests).toHaveLength(3);
+      expect(h.children).toHaveLength(2);
+      expect(h.requested).toEqual([]);
+      expect(h.unexpected).toEqual([]);
+    } finally { held.release(); await h.close(); }
+  }, 30_000);
+
+  test("queued native instruction wait ends explicitly and the original MCP resumes on the same child", async () => {
+    const replies = [{ content: [] as NativeBlock[] }, { content: [text("original result and saved B applied")] }];
+    const h = nativeSession(replies, { nativePersistence: true });
+    const action = call(h.input, "toolu_native_delayed_result", { path: "original.txt" });
+    replies[0]!.content = [{ type: "tool_use", id: action.id, name: `mcp__opencodex__${action.name}`, input: action.arguments }];
+    try {
+      const first = h.run(h.input);
+      await first.done;
+      expect(calls(first.events)).toEqual([{ type: "tool_call_start", id: action.id, name: "read_file" }]);
+      expect(first.events.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use" });
+      const original = h.children[0]!;
+      const history = [...h.input.parsed.context.messages, toolAssistant([action])];
+      const instructionB = "NATIVE_SAVED_B_AFTER_MISSING_RESULT_150";
+      (h.manager as any).deps.setupTimeoutMs = 150;
+      const waiting = h.run(withMessages(h.input, [...history, user(instructionB)]));
+      await nativeUntil(() => waiting.events.some(event => event.type === "error"), "B receives a bounded pending-result error", 2_000);
+      await waiting.done;
+      expect(waiting.events.filter(event => event.type === "error")).toEqual([
+        expect.objectContaining({ code: "claude_tool_results_pending", status: 409, retryable: false }),
+      ]);
+      expect(calls(waiting.events)).toEqual([]);
+      expect(h.journal.load(h.input.scope)!.instructions).toEqual([
+        expect.objectContaining({ phase: "queued", texts: [instructionB] }),
+      ]);
+      expect(h.requested).toEqual([action.id]);
+      expect(h.resolved).toEqual([]);
+      expect(h.requests).toHaveLength(1);
+      expect(h.children).toHaveLength(1);
+      expect(original.exitCode).toBeNull();
+      expect(original.signalCode).toBeNull();
+      expect(h.interrupts).toBe(0);
+
+      (h.manager as any).deps.setupTimeoutMs = 5_000;
+      const actualResult = "ACTUAL_ORIGINAL_NATIVE_TOOL_RESULT";
+      const continuation = withMessages(h.input, [...history, result(action.id, actualResult)]);
+      continuation.incoming = { ...continuation.incoming, headers: new Headers(continuation.incoming.headers) };
+      continuation.incoming.headers.set("idempotency-key", "native-delayed-result-C");
+      expect(JSON.stringify(continuation.parsed.context.messages)).not.toContain(instructionB);
+      const resumed = h.run(continuation);
+      await nativeUntil(() => resumed.events.some(event => event.type === "done" || event.type === "error"), "C applies the original result and saved B", 8_000);
+      await resumed.done;
+      final(resumed.events, "original result and saved B applied");
+      const messages = JSON.stringify(h.requests[1]!.messages);
+      expect(messages.split(instructionB)).toHaveLength(2);
+      expect(messages.split(actualResult)).toHaveLength(2);
+      expect(messages).toContain(action.id);
+      expect(h.journal.load(h.input.scope)!.instructions).toEqual([
+        expect.objectContaining({ phase: "completed", texts: [instructionB] }),
+      ]);
+      const replay = h.run(continuation);
+      await replay.done;
+      final(replay.events, "original result and saved B applied");
+      expect(h.requested).toEqual([action.id]);
+      expect(h.resolved).toEqual([action.id]);
+      expect(h.maxActive).toBe(1);
+      expect(h.requests).toHaveLength(2);
+      expect(h.children).toHaveLength(1);
+      expect(h.children[0]).toBe(original);
+      expect(original.exitCode).toBeNull();
+      expect(original.signalCode).toBeNull();
+      expect(h.interrupts).toBe(0);
+      expect(h.unexpected).toEqual([]);
+    } finally { await h.close(); }
+  }, 30_000);
 });
