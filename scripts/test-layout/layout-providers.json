@@ -13,6 +13,10 @@
   "claude-cli-session-followup.test.ts": "providers",
   "claude-cli-session-instructions.test.ts": "providers",
   "claude-cli-session-replay-order.test.ts": "providers",
+  "claude-cli-session-events.test.ts": "providers",
+  "claude-cli-session-native-sync.test.ts": "providers",
+  "claude-cli-session-continuity.test.ts": "providers",
+  "claude-cli-session-continuity-native.test.ts": "providers",
   "free-directory-runcrate.test.ts": "providers",
   "cc-switch-import.test.ts": "providers",
   "kiro-completion-with-real-tools.test.ts": "providers/kiro"

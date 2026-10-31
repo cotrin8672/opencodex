@@ -63,6 +63,8 @@ export async function until(check: () => boolean): Promise<void> {
 
 const envelope = { uuid: "00000000-0000-4000-8000-000000000001", session_id: "offline-session", parent_tool_use_id: null };
 export class ControlledWorker implements ClaudeSessionWorker {
+  private responseId = "msg_offline";
+  private responseOrdinal = 0;
   sends: string[] = [];
   sendOptions: Array<{ uuid?: string; shouldQuery?: boolean; priority?: "now" | "next" | "later" } | undefined> = [];
   updates: ClaudeWorkerOptions["tools"][] = [];
@@ -78,11 +80,19 @@ export class ControlledWorker implements ClaudeSessionWorker {
   }
   async updateTools(tools: ClaudeWorkerOptions["tools"]) { this.updates.push(structuredClone(tools)); }
   stop() { this.stops++; }
-  async emit(message: Record<string, unknown>) { await this.options.onMessage({ ...envelope, ...message }); }
+  async emit(message: Record<string, unknown>) {
+    if (message.type === "assistant") message = { ...message, message: {
+      id: this.responseId, type: "message", model: this.options.model, stop_reason: null, stop_sequence: null,
+      usage: { input_tokens: 3, output_tokens: 4 }, ...message.message as object,
+    } };
+    await this.options.onMessage({ ...envelope, uuid: crypto.randomUUID(),
+      session_id: this.options.sessionId ?? this.options.resume ?? envelope.session_id, ...message } as Parameters<ClaudeWorkerOptions["onMessage"]>[0]);
+  }
   async raw(event: Record<string, unknown>) { await this.emit({ type: "stream_event", event }); }
   async begin() {
+    this.responseId = `msg_offline_${++this.responseOrdinal}`;
     await this.raw({ type: "message_start", message: {
-      id: "msg_offline", type: "message", role: "assistant", model: "offline-model", content: [],
+      id: this.responseId, type: "message", role: "assistant", model: "offline-model", content: [],
       stop_reason: null, stop_sequence: null, usage: { input_tokens: 3, output_tokens: 0 },
     } });
   }
@@ -130,10 +140,12 @@ export class ControlledWorker implements ClaudeSessionWorker {
 }
 
 const managers: ClaudeSessionManager[] = [];
-afterEach(() => { for (const manager of managers.splice(0)) manager.close(); });
+afterEach(async () => { await Promise.all(managers.splice(0).map(manager => manager.close())); });
 export function harness(journal = new MemoryJournal(), deps: Omit<ClaudeSessionManagerDeps, "journal" | "createWorker"> = {}) {
   const workers: ControlledWorker[] = [];
-  const manager = new ClaudeSessionManager({ journal, ...deps, createWorker: async options => {
+  const manager = new ClaudeSessionManager({ journal, nativeIO: {
+    getSessionMessages: async () => [], forkSession: async () => { throw new Error("No simulated transcript was registered"); },
+  }, ...deps, createWorker: async options => {
     const worker = new ControlledWorker(options);
     workers.push(worker);
     return worker;

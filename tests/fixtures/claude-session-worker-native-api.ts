@@ -3,7 +3,7 @@ import { execFileSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { query, type Query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { createClaudeSessionWorker, type ClaudeWorkerOptions } from "../../src/adapters/claude-cli/session-worker";
 import { isTestHomeGuardArmed } from "../../src/lib/test-home-guard";
 import { repoPath, repoRoot } from "../helpers/repo-root";
@@ -67,7 +67,7 @@ export async function nativeWorker(replies: Reply[], onToolCall: ClaudeWorkerOpt
   const unexpected: string[] = [];
   const children: ChildProcess[] = [];
   const raw: Record<string, unknown>[] = [];
-  const messages: Record<string, unknown>[] = [];
+  const messages: SDKMessage[] = [];
   const errors: Error[] = [];
   const written: SDKUserMessage[] = [];
   const shutdown = workerGate();
@@ -101,7 +101,7 @@ export async function nativeWorker(replies: Reply[], onToolCall: ClaudeWorkerOpt
   });
   let session!: Query;
   const worker = await createClaudeSessionWorker({
-    binary: workerNativeBinary, model: "claude-opus-4-6", systemPrompt: "Offline worker proof", env,
+    binary: workerNativeBinary, model: "claude-opus-4-6", systemPrompt: "Offline worker proof", env, cwd: home,
     tools: [{ name: "run", description: "Client-owned operation", inputSchema: { type: "object", properties: {}, additionalProperties: false } }],
     onToolCall, onMessage: message => { messages.push(message); }, onError: error => { errors.push(error); },
     query: params => {
@@ -112,7 +112,11 @@ export async function nativeWorker(replies: Reply[], onToolCall: ClaudeWorkerOpt
           yield frame;
           written.push(frame); // The SDK resumed the iterator after awaiting transport.write.
         }
-      })(), options: { ...params.options, cwd: home, spawnClaudeCodeProcess: launch => {
+      })(), options: { ...params.options, spawnClaudeCodeProcess: launch => {
+        assert.equal(launch.cwd, home);
+        assert.equal(launch.env.CLAUDE_CODE_ENTRYPOINT, "sdk-ts");
+        assert.equal(launch.env.CLAUDE_AGENT_SDK_VERSION, "0.3.314");
+        assert.equal(launch.env.CLAUDE_CODE_SDK_READS_SESSION_STATE, "1");
         const child = params.options!.spawnClaudeCodeProcess!(launch);
         children.push(child as ChildProcess);
         let buffer = "";
@@ -138,7 +142,7 @@ export async function nativeWorker(replies: Reply[], onToolCall: ClaudeWorkerOpt
       await session.mcpServerStatus(); // Native control ack after the earlier stdin frame.
     },
     async close() {
-      worker.stop(); shutdown.release();
+      await worker.stop(); shutdown.release();
       await server.stop(true);
       await workerUntil(() => children.every(child => child.exitCode !== null || child.signalCode !== null), "owned child exit", 3_000);
       assert.equal(dirname(realpathSync(home)), tempRoot);

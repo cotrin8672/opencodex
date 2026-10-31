@@ -3,7 +3,7 @@ import { claudeHistory, historyExtends } from "./session-context";
 import { ClaudeSessionError } from "./session-errors";
 import type { ClaudeQueuedInstruction } from "./session-journal";
 
-function prefixBoundary(messages: OcxMessage[], history: string[]): number | undefined {
+export function claudeHistoryBoundary(messages: OcxMessage[], history: string[]): number | undefined {
   if (!history.length) return 0;
   let count = 0;
   let previousAssistant = false;
@@ -39,10 +39,34 @@ function unprovenHistory(): never {
 
 /** Compare raw boundaries because adjacent assistant fragments collapse in claudeHistory. */
 export function extractClaudeInstructions(messages: OcxMessage[], prefixHistory: string[]): string[] | undefined {
-  const start = prefixBoundary(messages, prefixHistory);
+  const start = claudeHistoryBoundary(messages, prefixHistory);
   if (start === undefined) return undefined;
   const texts = messages.slice(start).map(userText).filter(text => text.length > 0);
   return texts.length ? texts : undefined;
+}
+
+/** A live instruction/result write cannot import an unseen foreign assistant turn. */
+export function claudeInstructionContinuation(messages: OcxMessage[], prefix: string[], nativeAssistant: OcxMessage | undefined,
+  resultIds: ReadonlySet<string>): boolean {
+  const start = claudeHistoryBoundary(messages, prefix);
+  if (start === undefined) return false;
+  let afterUser = false;
+  let partial = "";
+  for (const message of messages.slice(start)) {
+    if (message.role === "developer") continue;
+    if (message.role === "user") { afterUser = true; continue; }
+    if (message.role === "toolResult") {
+      if (!resultIds.has(message.toolCallId)) return false;
+      continue;
+    }
+    if (!claudeHistory([message]).length) continue;
+    if (afterUser || nativeAssistant?.role !== "assistant") return false;
+    if (message.content.some(part => part.type === "toolCall")) return false;
+    partial += message.content.filter(part => part.type === "text").map(part => part.text).join("");
+    const known = nativeAssistant.content.filter(part => part.type === "text").map(part => part.text).join("");
+    if (!known.startsWith(partial)) return false;
+  }
+  return true;
 }
 
 /** Unproven pending histories fail closed; callers must retain their journal entries for recovery. */
@@ -71,11 +95,11 @@ export function restoreClaudeInstructions(messages: OcxMessage[], entries: Claud
   for (const entry of entries) {
     if (seen.has(entry.inputHash)) continue;
     seen.add(entry.inputHash);
-    let start = prefixBoundary(restored, entry.history);
+    let start = claudeHistoryBoundary(restored, entry.history);
     if (start === undefined && missing.length) {
       // A later accepted history may include an earlier instruction omitted by the client.
       insert(insertionPoint());
-      start = prefixBoundary(restored, entry.history);
+      start = claudeHistoryBoundary(restored, entry.history);
     }
     if (start === undefined) {
       if (entry.phase === "completed") continue;

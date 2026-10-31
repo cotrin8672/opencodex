@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { OcxMessage } from "../../src/types";
-import { buildClaudeSessionBootstrap, claudeHistory, claudeOperationIdentity, claudeSessionScope, claudeToolResultContinuation } from "../../src/adapters/claude-cli/session-context";
+import { buildClaudeSessionBootstrap, buildClaudeSessionCatchUp, claudeHistory, claudeOperationIdentity, claudeSessionScope } from "../../src/adapters/claude-cli/session-context";
 import { buildCodeBuddyToolBridge } from "../../src/adapters/codebuddy/tool-bridge";
 import { assistant, result, turn, user } from "../fixtures/claude-session-worker";
 
@@ -78,37 +78,22 @@ describe("Claude stable operation identity", () => {
   });
 });
 
-describe("Claude tool-result continuation", () => {
-  const prefix: OcxMessage[] = [user("Read the report"), { role: "assistant", timestamp: 0, content: [
-    { type: "toolCall", id: "call-A", name: "read_file", arguments: {} },
-    { type: "toolCall", id: "call-B", name: "read_file", arguments: {} },
-  ] }];
-  const history = claudeHistory(prefix);
-  const expected = new Set(["call-A", "call-B"]);
-
-  test("accepts only a nonempty suffix of pending results after exactly the snapshot history", () => {
-    expect(claudeToolResultContinuation([...prefix, result("call-B", "B"), result("call-A", "A")], history, expected)).toBe(true);
-    expect(claudeToolResultContinuation([...prefix, result("call-A", "A")], history, expected)).toBe(true);
-    expect(claudeToolResultContinuation(prefix, history, expected)).toBe(false);
-    expect(claudeToolResultContinuation([], [], expected)).toBe(false);
-    expect(claudeToolResultContinuation([...prefix, result("unknown", "A")], history, expected)).toBe(false);
-    expect(claudeToolResultContinuation([...prefix, result("call-A", "A")], history, new Set())).toBe(false);
-  });
-
-  test("refuses steering before, between, or after tool results and changed/rebased prefixes", () => {
-    const steering = user("Cancel the upload; summarize locally only.");
-    for (const messages of [
-      [...prefix, steering, result("call-A", "A")],
-      [...prefix, result("call-A", "A"), steering, result("call-B", "B")],
-      [...prefix, result("call-A", "A"), steering],
-      [user("Changed request"), ...prefix.slice(1), result("call-A", "A")],
-      [...prefix.slice(1), result("call-A", "A")],
-      [...prefix, assistant("New assistant text"), result("call-A", "A")],
-    ]) expect(claudeToolResultContinuation(messages, history, expected)).toBe(false);
-  });
-});
-
 describe("Claude session bootstrap", () => {
+  test("catch-up sends only the unseen foreign model history and current user input", () => {
+    const input = turn([user("SEEN_USER_A"), assistant("SEEN_CLAUDE_A"), user("FOREIGN_USER_B"),
+      assistant("FOREIGN_GPT_B"), user("CURRENT_USER_C")]);
+    const text = buildClaudeSessionCatchUp(input.parsed, input.provider, input.bridge, 2);
+    expect(text).not.toContain("SEEN_USER_A");
+    expect(text).not.toContain("SEEN_CLAUDE_A");
+    for (const marker of ["FOREIGN_USER_B", "FOREIGN_GPT_B", "CURRENT_USER_C"]) expect(text.split(marker)).toHaveLength(2);
+    expect(text).toContain("ASSISTANT");
+  });
+
+  test("ordinary native continuation preserves the new user text verbatim", () => {
+    const input = turn([user("prior"), assistant("answer"), user("/init @literal-file next")]);
+    expect(buildClaudeSessionCatchUp(input.parsed, input.provider, input.bridge, 2)).toBe("/init @literal-file next");
+  });
+
   test("projects historical same-name tools into distinct advertised MCP names", () => {
     const input = turn();
     input.parsed.context.tools = ["db_primary", "db_archive"].map(namespace => ({

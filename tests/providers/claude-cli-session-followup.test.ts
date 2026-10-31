@@ -51,7 +51,7 @@ describe("Claude durable follow-up ownership", () => {
     const saved = h.journal.load(input.scope)!.instructions![0]!;
     expect(saved).toMatchObject({ history: claudeHistory(input.parsed.context.messages), texts: [instructionB], phase: "sent" });
 
-    if (cold) h.manager.close();
+    if (cold) await h.manager.close();
     const owner = cold ? harness(h.journal) : h;
     const c = await owner.start(operation(input, "operation-C", [...input.parsed.context.messages, user("Continue with C")]));
     await b.done;
@@ -70,7 +70,7 @@ describe("Claude durable follow-up ownership", () => {
     const { h, input, first, actions, pending, history, bInput } = await handoff();
     const b = await queued(h, bInput);
     const inputHash = h.journal.load(input.scope)!.instructions![0]!.inputHash;
-    h.manager.close();
+    await h.manager.close();
     await b.done;
     await expect(pending[0]!).rejects.toThrow("worker stopped");
     expect(first.worker.stops).toBe(1);

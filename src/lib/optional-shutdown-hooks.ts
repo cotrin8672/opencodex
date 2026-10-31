@@ -12,14 +12,15 @@
  * A subsystem registers its teardown when it activates. A process that never activates it
  * registers nothing, so shutdown does no work and loads no module.
  *
- * Hooks are synchronous and best-effort by contract: `drainAndShutdown` runs under an
- * absolute deadline, so a hook that throws must not prevent its siblings — or
- * `server.stop` — from running.
+ * Hooks start synchronously; returned promises join best-effort teardown. `drainAndShutdown`
+ * bounds that join by its absolute deadline. A throwing or rejecting hook must not prevent
+ * its siblings — or `server.stop` — from running.
  *
  * See devlog/_fin/260814_lab_core_decoupling/010_lifecycle_shutdown_registry.md
  */
 
-type ShutdownHook = () => void;
+// Synchronous callbacks may return incidental values; only promise settlement matters.
+type ShutdownHook = () => unknown;
 
 const hooks = new Map<string, ShutdownHook>();
 let hooksRan = false;
@@ -52,19 +53,21 @@ export function didRunOptionalShutdownHooks(): boolean {
   return hooksRan;
 }
 
-/** Run every registered teardown. Never throws. */
-export function runOptionalShutdownHooks(): void {
+/** Start every teardown immediately and join returned promises. Never throws or rejects. */
+export function runOptionalShutdownHooks(): Promise<void> {
   hooksRan = true;
+  const pending: Promise<unknown>[] = [];
   for (const [key, hook] of [...hooks]) {
+    const failed = (err: unknown) => {
+      console.warn(`[shutdown] optional subsystem "${key}" teardown failed:`, err instanceof Error ? err.message : err);
+    };
     try {
-      hook();
+      pending.push(Promise.resolve(hook()).catch(failed));
     } catch (err) {
-      console.warn(
-        `[shutdown] optional subsystem "${key}" teardown failed:`,
-        err instanceof Error ? err.message : err,
-      );
+      failed(err);
     }
   }
+  return Promise.all(pending).then(() => {});
 }
 
 /** Test-only reset so an isolated lifecycle test does not inherit registrations. */
@@ -75,7 +78,7 @@ export function resetOptionalShutdownHooksForTests(): void {
   hooksRan = false;
 }
 
-const drainStartHooks = new Map<string, ShutdownHook>();
+const drainStartHooks = new Map<string, () => void>();
 let drainStartHooksRan = false;
 
 /**
@@ -84,7 +87,7 @@ let drainStartHooksRan = false;
  * stop, so the sentinel is withdrawn before the drain can look unresponsive. Same contract as
  * {@link registerOptionalShutdownHook}: keyed, synchronous, best-effort, detachable.
  */
-export function registerDrainStartHook(key: string, hook: ShutdownHook): () => void {
+export function registerDrainStartHook(key: string, hook: () => void): () => void {
   drainStartHooks.set(key, hook);
   return () => {
     if (drainStartHooks.get(key) === hook) drainStartHooks.delete(key);

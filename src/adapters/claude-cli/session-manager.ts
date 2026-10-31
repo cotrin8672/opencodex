@@ -1,16 +1,20 @@
 import type { AdapterEvent, OcxMessage, OcxParsedRequest, OcxProviderConfig } from "../../types";
+import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { resolve } from "node:path";
 import type { IncomingMeta } from "../base";
 import type { CodeBuddyToolBridge } from "../codebuddy/tool-bridge";
 import { CODEBUDDY_MCP_TOOL_PREFIX, CODEBUDDY_TOOL_LIMITS } from "../codebuddy/tool-bridge";
-import { CodingAgentProtocolError, mapStreamMessageToEvents, releaseOpenToolBlocks, usageFromResult, type StreamParseState } from "../coding-agent/protocol";
+import { CodingAgentProtocolError, usageFromResult } from "../coding-agent/protocol";
 import { SendBudgetExhaustedError } from "../../lib/upstream-retry";
 import { getConfigDir } from "../../config/paths";
 import { createTranslatorBudget, isTranslatorBudgetExceededError } from "../../lib/translator-budget";
 import { registerOptionalShutdownHook, didRunOptionalShutdownHooks } from "../../lib/optional-shutdown-hooks";
-import { buildClaudeSessionBootstrap, claudeAccountIdentity, claudeDigest, claudeHistory, claudeOperationIdentity, claudeToolResultContinuation, claudeUserText, historyExtends } from "./session-context";
+import { buildClaudeSessionCatchUp, claudeAccountIdentity, claudeDigest, claudeHistory, claudeOperationIdentity, historyExtends } from "./session-context";
 import { openClaudeSessionJournal, type ClaudeSessionJournal, type ClaudeSessionSnapshot, type ClaudeToolReceipt, type ClaudeTurnReceipt } from "./session-journal";
 import { prepareClaudeToolResults } from "./session-recovery";
-import { extractClaudeInstructions, restoreClaudeInstructions } from "./session-instructions";
+import { claudeHistoryBoundary, claudeInstructionContinuation, extractClaudeInstructions, restoreClaudeInstructions } from "./session-instructions";
+import { planClaudeNativeSession, type ClaudeNativeSessionIO } from "./session-native";
+import { createClaudeSdkStreamState, mapClaudeSdkMessage, releaseClaudeSdkBlocks, type ClaudeSdkStreamState } from "./session-events";
 import { ClaudeSessionError } from "./session-errors";
 import type { ClaudeSessionWorker, ClaudeWorkerOptions, ClaudeWorkerToolCall } from "./session-worker";
 
@@ -32,6 +36,8 @@ export interface ClaudePersistentTurn {
 export interface ClaudeSessionManagerDeps {
   journal?: ClaudeSessionJournal;
   createWorker?: (options: ClaudeWorkerOptions) => Promise<ClaudeSessionWorker>;
+  nativeIO?: ClaudeNativeSessionIO;
+  nativeDirectory?: string;
   timeoutMs?: number;
   reconnectGraceMs?: number;
   idleMs?: number;
@@ -49,7 +55,7 @@ type QueuedTool = { call: ClaudeToolReceipt; nativeName: string; events: Adapter
 type Leg = {
   input?: ClaudePersistentTurn;
   receipt: ClaudeTurnReceipt;
-  state: StreamParseState;
+  state: ClaudeSdkStreamState;
   openCall?: ClaudeToolReceipt;
   nativeNames: Map<string, string>;
   mcpIds: Set<string>;
@@ -58,6 +64,7 @@ type Leg = {
   waitingResults?: boolean;
   interrupting?: boolean;
   nativeId: string;
+  assistantId?: string;
   instructionIds: string[];
   finished: boolean;
   bytes: number;
@@ -86,8 +93,10 @@ type Session = {
 /** One owner per conversation; a disconnected HTTP response does not own the Claude process. */
 export class ClaudeSessionManager {
   private readonly sessions = new Map<string, Session>();
+  private readonly closingWorkers = new Map<string, Promise<void>>();
   private readonly journal: ClaudeSessionJournal;
   private closed = false;
+  private closing?: Promise<void>;
 
   constructor(private readonly deps: ClaudeSessionManagerDeps = {}) {
     this.journal = deps.journal ?? openClaudeSessionJournal();
@@ -123,7 +132,9 @@ export class ClaudeSessionManager {
       if (this.closed) throw new ClaudeSessionError("Claude sessions are shutting down.", "claude_session_shutdown", 503);
       if (input.incoming.abortSignal?.aborted) return;
       let history = claudeHistory(input.parsed.context.messages);
-      const configuration = claudeDigest([input.parsed.modelId, input.binary, input.systemPrompt, input.effort, input.env.CLAUDE_CONFIG_DIR, claudeAccountIdentity()]);
+      const account = claudeAccountIdentity();
+      const identity = claudeDigest([input.binary, input.env.CLAUDE_CONFIG_DIR, account]);
+      const configuration = claudeDigest([input.parsed.modelId, input.binary, input.systemPrompt, input.effort, input.env.CLAUDE_CONFIG_DIR, account]);
       const catalog = claudeDigest(input.bridge.tools);
       const operationId = claudeOperationIdentity(input.parsed, input.incoming);
       const fingerprint = (): string => claudeDigest([history, configuration, catalog, input.parsed.options, operationId]);
@@ -185,7 +196,7 @@ export class ClaudeSessionManager {
           const sameWorker = session.worker && session.configuration === configuration && session.catalog === catalog;
           let steered = false;
           if (current && !current.finished && !current.waitingResults) {
-            if (sameWorker && extending) {
+            if (sameWorker && extending && claudeInstructionContinuation(restored, session.snapshot.history, this.assistant(current.receipt), new Set())) {
               await this.interruptGeneration(session);
               steered = true;
             } else this.fail(session, new ClaudeSessionError("A newer input replaced this Claude generation.", "claude_turn_superseded", 499));
@@ -204,15 +215,21 @@ export class ClaudeSessionManager {
             leg.receipt.events.push({ type: "heartbeat", replayUnsafe: true });
             this.save(session);
           } else {
-            const last = input.parsed.context.messages.at(-1);
             const extendsHistory = historyExtends(history, session.snapshot.history);
             const nativeContinuation = session.worker && session.configuration === configuration && (extendsHistory || steered)
               && (!session.queued.length || session.catalog === catalog)
               && (pendingTurns.length > 0
-                ? (claudeToolResultContinuation(restored, session.snapshot.history, new Set(pendingTurns.flatMap(turn => turn.calls.map(call => call.id)))) || extending)
+                ? claudeInstructionContinuation(restored, session.snapshot.history, undefined, new Set(pendingTurns.flatMap(turn => turn.calls.map(call => call.id))))
                   && pendingTurns.every(turn => turn.calls.every(call => session.pending.has(call.id)))
-                : steered || history.length === session.snapshot.history.length + 1 && last?.role === "user");
-            if (!nativeContinuation) this.stopWorker(session);
+                : steered || history.length > session.snapshot.history.length);
+            let start = claudeHistoryBoundary(restored, session.snapshot.history) ?? 0;
+            let resume: string | undefined;
+            const directory = resolve(this.deps.nativeDirectory ?? getConfigDir());
+            if (!nativeContinuation) {
+              await this.stopWorker(session);
+              const plan = await planClaudeNativeSession({ record: session.snapshot.native, messages: restored, identity, directory }, this.deps.nativeIO);
+              session.snapshot.native = plan.native; start = plan.start; resume = plan.resume;
+            }
             if (session.snapshot.turns.length >= 4096 && !previous) throw new ClaudeSessionError("This conversation reached its receipt limit; start a new conversation.", "claude_session_history_limit", 413);
             if (previous) session.snapshot.turns.splice(session.snapshot.turns.indexOf(previous), 1);
             leg = this.newLeg(session, input, inputHash, historyHash, operationId, requestHash);
@@ -221,6 +238,7 @@ export class ClaudeSessionManager {
             if (nativeContinuation && pendingTurns.length) leg.nativeId = session.nativeId ?? leg.nativeId;
             leg.waitingTools = !!nativeContinuation && pendingTurns.length > 0 && session.queued.length > 0;
             session.snapshot.history = history;
+            if (session.snapshot.native) session.snapshot.native.dirty = true;
             this.save(session);
             if (!session.worker) {
               const createWorker = this.deps.createWorker ?? (await import("./session-worker")).createClaudeSessionWorker;
@@ -228,13 +246,14 @@ export class ClaudeSessionManager {
               const epoch = session.epoch;
               const worker = await createWorker({
                 binary: input.binary, model: input.parsed.modelId, env: input.env, systemPrompt: input.systemPrompt,
-                effort: input.effort, tools: input.bridge.tools,
+                effort: input.effort, tools: input.bridge.tools, cwd: directory, persistSession: true,
+                ...(resume ? { resume } : { sessionId: session.snapshot.native!.sessionId }),
                 onMessage: message => { if (owner.epoch === epoch) this.onMessage(owner, message); },
                 onToolCall: (call, signal) => owner.epoch === epoch ? this.onToolCall(owner, call, signal)
                   : Promise.reject(new ClaudeSessionError("The Claude worker was replaced.", "claude_turn_superseded", 499)),
                 onError: error => { if (owner.epoch === epoch) this.fail(owner, error); },
               });
-              if (leg.finished || this.closed) worker.stop();
+              if (leg.finished || this.closed) await worker.stop();
               else {
                 session.worker = worker;
                 session.configuration = configuration;
@@ -268,9 +287,8 @@ export class ClaudeSessionManager {
                 }
                 this.finishTools(session);
               } else {
-                const text = nativeContinuation && last
-                  ? (steered && newTexts.length ? newTexts.join("\n\n") : claudeUserText(last))
-                  : buildClaudeSessionBootstrap(input.parsed, input.provider, input.bridge);
+                const text = steered && newTexts.length ? newTexts.join("\n\n")
+                  : buildClaudeSessionCatchUp(input.parsed, input.provider, input.bridge, start);
                 session.nativeId = leg.nativeId;
                 await session.worker.send(text, { uuid: leg.nativeId });
               }
@@ -373,7 +391,7 @@ export class ClaudeSessionManager {
   private finishLeg(session: Session, leg: Leg): void {
     leg.finished = true;
     if (leg.timer) clearTimeout(leg.timer);
-    releaseOpenToolBlocks(leg.state);
+    releaseClaudeSdkBlocks(leg.state);
     leg.state.translatorBudget?.dispose();
     leg.release(); leg.release = () => {};
     leg.input = undefined;
@@ -386,9 +404,8 @@ export class ClaudeSessionManager {
     const receipt: ClaudeTurnReceipt = { inputHash, historyHash, ...(operationId ? { operationId } : {}),
       ...(requestHash !== inputHash ? { requestHash } : {}), phase: "running", events: [], calls: [], updatedAt: Date.now() };
     const leg: Leg = {
-      input, receipt, state: { sawPartialText: false, sawPartialThinking: false, sawTerminalResult: false,
-        openToolBlocks: new Map(), partialToolCallIds: new Set(), strictToolBlockCapture: true, translatorBudget: createTranslatorBudget(),
-        completeAssistantToolUse: true, toolBridgeNames: input.bridge.emittedNameMap, maxToolBlockStarts: CODEBUDDY_TOOL_LIMITS.maxTurnToolCalls },
+      input, receipt, state: createClaudeSdkStreamState({ translatorBudget: createTranslatorBudget(),
+        toolBridgeNames: input.bridge.emittedNameMap, maxToolBlockStarts: CODEBUDDY_TOOL_LIMITS.maxTurnToolCalls }),
       nativeNames: new Map(), mcpIds: new Set(), buffered: false, finished: false, bytes: 0,
       nativeId: crypto.randomUUID(), instructionIds: [],
       done: new Promise(resolve => { settle = resolve; }), settle: () => settle(), release: () => {},
@@ -418,11 +435,11 @@ export class ClaudeSessionManager {
     leg.release = () => { if (!released) { released = true; permit?.release(); producer?.close(); } };
   }
 
-  private onMessage(session: Session, message: Record<string, unknown>): void {
+  private onMessage(session: Session, message: SDKMessage): void {
     const leg = session.active;
     if (!leg || leg.finished) return;
-    if (typeof message.user_message_uuid === "string" && message.user_message_uuid !== leg.nativeId
-      && !(Array.isArray(message.user_message_uuids) && message.user_message_uuids.includes(leg.nativeId))) return;
+    if ("user_message_uuid" in message && typeof message.user_message_uuid === "string" && message.user_message_uuid !== leg.nativeId
+      && !("user_message_uuids" in message && message.user_message_uuids?.includes(leg.nativeId))) return;
     if (leg.interrupting) {
       if (message.type === "result") {
         leg.state.partialUsage = usageFromResult(message) ?? leg.state.partialUsage;
@@ -435,16 +452,17 @@ export class ClaudeSessionManager {
       if (message.type === "result") this.fail(session, new ClaudeSessionError("Claude ended its native turn before the external results arrived.", "claude_tool_continuation_lost", 502, true));
       return;
     }
+    if (message.type === "assistant" && message.parent_tool_use_id == null) leg.assistantId = message.uuid;
     try {
       leg.bytes += Buffer.byteLength(JSON.stringify(message));
       if (leg.bytes > 64 * 1024 * 1024) throw new ClaudeSessionError("Claude output exceeded its buffer limit.", "claude_session_buffer_limit", 502);
-      const raw = message.type === "stream_event" ? message.event as Record<string, unknown> : undefined;
+      const raw = message.type === "stream_event" ? message.event : undefined;
       if (raw?.type === "message_start") leg.state.sawMessageStop = false;
-      const events = mapStreamMessageToEvents(message, leg.state);
+      const events = mapClaudeSdkMessage(message, leg.state);
       if (leg.state.toolCallLimitExceeded || leg.state.uncapturedToolUse) throw new ClaudeSessionError("Claude returned an invalid tool batch.", "claude_tool_protocol_error", 502);
       for (const event of events) {
         if (event.type === "error") {
-          if (message.type === "result") {
+          if (message.type === "assistant" || message.type === "result") {
             try { leg.input!.onCliOutputError?.(event.message); } catch { /* Observers cannot replace the CLI failure. */ }
           }
           this.fail(session, new ClaudeSessionError(event.message, event.code ?? "claude_cli_error", event.status ?? 502,
@@ -588,6 +606,12 @@ export class ClaudeSessionManager {
     receipt.phase = phase;
     receipt.updatedAt = Date.now();
     draft.history = claudeHistory([...leg.input!.parsed.context.messages, this.assistant(receipt)]);
+    if (phase === "completed" && draft.native && leg.assistantId) {
+      draft.native.history = draft.history;
+      draft.native.checkpoints = [...draft.native.checkpoints.filter(point => point.length < draft.history.length),
+        { length: draft.history.length, messageId: leg.assistantId }].slice(-64);
+      draft.native.dirty = false;
+    }
     if (phase === "completed") for (const entry of draft.instructions ?? []) {
       if (leg.instructionIds.includes(entry.inputHash)) entry.phase = "completed";
     }
@@ -690,7 +714,7 @@ export class ClaudeSessionManager {
       retryable: error instanceof ClaudeSessionError ? error.retryable : !(error instanceof CodingAgentProtocolError || isTranslatorBudgetExceededError(error)),
       ...(error instanceof ClaudeSessionError ? error.details : {}) });
     leg.finished = true;
-    releaseOpenToolBlocks(leg.state);
+    releaseClaudeSdkBlocks(leg.state);
     leg.state.translatorBudget?.dispose();
     leg.release();
     leg.release = () => {};
@@ -700,15 +724,26 @@ export class ClaudeSessionManager {
     leg.settle();
   }
 
-  private stopWorker(session: Session): void {
+  private stopWorker(session: Session): Promise<void> {
     const worker = session.worker;
     session.worker = undefined;
     session.nativeId = undefined;
     session.epoch++;
     session.queued = [];
-    worker?.stop();
+    if (worker) {
+      const previous = this.closingWorkers.get(session.scope);
+      let stopped: Promise<void>;
+      try { stopped = Promise.resolve(worker.stop()); }
+      catch (error) { stopped = Promise.reject(error); }
+      const closing = Promise.all([previous, stopped]).then(() => {});
+      this.closingWorkers.set(session.scope, closing);
+      void closing.then(() => {
+        if (this.closingWorkers.get(session.scope) === closing) this.closingWorkers.delete(session.scope);
+      }, () => {});
+    }
     for (const pending of session.pending.values()) pending.reject(new Error("The Claude worker stopped."));
     session.pending.clear();
+    return this.closingWorkers.get(session.scope) ?? Promise.resolve();
   }
 
   private armIdle(session: Session): void {
@@ -724,15 +759,21 @@ export class ClaudeSessionManager {
     session.idle.unref?.();
   }
 
-  close(): void {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closing) return this.closing;
     this.closed = true;
     for (const session of this.sessions.values()) {
       if (session.idle) clearTimeout(session.idle);
       this.fail(session, new ClaudeSessionError("The Claude session manager is shutting down.", "claude_session_shutdown", 503, true));
     }
-    this.sessions.clear();
-    this.journal.close();
+    this.closing = (async () => {
+      try {
+        await Promise.all([...this.sessions.values()].map(session => session.setup));
+        await Promise.all(this.closingWorkers.values());
+      } finally { this.sessions.clear(); this.journal.close(); }
+    })();
+    void this.closing.catch(() => {});
+    return this.closing;
   }
 }
 
@@ -744,7 +785,7 @@ export function getClaudeSessionManager(): ClaudeSessionManager {
   if (!manager) {
     manager = new ClaudeSessionManager();
     managers.set(home, manager);
-    registerOptionalShutdownHook(`claude-cli-sessions:${home}`, () => { manager!.close(); managers.delete(home); });
+    registerOptionalShutdownHook(`claude-cli-sessions:${home}`, () => { const closing = manager!.close(); managers.delete(home); return closing; });
   }
   return manager;
 }

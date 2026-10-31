@@ -42,6 +42,13 @@ export function buildClaudeSessionBootstrap(parsed: OcxParsedRequest, provider: 
   return frame.message.content.map((part: { text: string }) => part.text).join("\n\n");
 }
 
+/** Replay only the part this native session has not seen; keep foreign tool calls as history. */
+export function buildClaudeSessionCatchUp(parsed: OcxParsedRequest, provider: OcxProviderConfig, bridge: CodeBuddyToolBridge, start: number): string {
+  const messages = parsed.context.messages.slice(start).filter(message => message.role !== "developer");
+  if (messages.length === 1 && messages[0]!.role === "user") return claudeUserText(messages[0]!);
+  return buildClaudeSessionBootstrap({ ...parsed, context: { ...parsed.context, messages } }, provider, bridge);
+}
+
 /** A parent thread and a prompt-cache cohort must never merge parallel child conversations. */
 export function claudeSessionScope(parsed: OcxParsedRequest, incoming: IncomingMeta, provider: OcxProviderConfig): string | undefined {
   const thread = [parsed._codexOwnThreadId, incoming.headers.get("thread-id"),
@@ -109,20 +116,6 @@ export function claudeHistory(messages: OcxMessage[]): string[] {
 
 export function historyExtends(history: string[], prefix: string[]): boolean {
   return history.length >= prefix.length && prefix.every((hash, index) => history[index] === hash);
-}
-
-/** Native MCP completion must not skip any new instruction in the supplied history. */
-export function claudeToolResultContinuation(messages: OcxMessage[], prefixHistory: string[], expectedCallIds: ReadonlySet<string>): boolean {
-  let suffix = messages.length;
-  while (suffix > 0) {
-    const message = messages[suffix - 1]!;
-    if (message.role !== "toolResult") break;
-    if (!expectedCallIds.has(message.toolCallId)) return false;
-    suffix--;
-  }
-  if (suffix === messages.length) return false;
-  const prefix = claudeHistory(messages.slice(0, suffix));
-  return prefix.length === prefixHistory.length && historyExtends(prefix, prefixHistory);
 }
 
 export function claudeUserText(message: OcxMessage): string {

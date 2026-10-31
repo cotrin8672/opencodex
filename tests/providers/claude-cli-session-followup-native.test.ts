@@ -191,7 +191,7 @@ describe.skipIf(!nativeBinary)("Claude native additional-instruction acceptance"
     try {
       const { pending } = await holdToolThenQueueB(h, action);
       oldPid = h.children[0]!.pid;
-      h.manager.close();
+      await h.manager.close();
       await pending.done;
       expect(queuedB(h)).toBe(true);
       expect(h.resolved).toEqual([]);

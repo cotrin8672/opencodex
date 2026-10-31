@@ -34,19 +34,30 @@ Some adapters share another adapter's routed-tool semantics while retaining inde
   providers keep resolving to this adapter with their stored configuration, while new-provider
   discovery (presets, the init menu, the featured list, and key logins) excludes it and
   `provider add` warns before creating one.
-- `claude-cli` inherits the `codebuddy` stream-event and client tool-ownership contract, with
-  independent session ownership in `src/adapters/claude-cli/`. An explicit own conversation ID
-  selects an official SDK worker; requests without one retain the shared one-shot runner.
+- `claude-cli` preserves the client tool-ownership contract with independent session ownership in
+  `src/adapters/claude-cli/`. An explicit own conversation ID selects an official SDK worker and
+  the typed `src/adapters/claude-cli/session-events.ts` mapper; requests without one retain the shared
+  one-shot runner and coding-agent mapper. `src/adapters/claude-cli/session-native.ts` plans public SDK
+  resume/fork from completed safe checkpoints. The stable cwd is the OpenCodex home; per-chat native
+  IDs bind to a hash of the account, profile and binary. Only unseen source-history suffixes are
+  imported, including foreign model turns. Dirty tool/in-flight tails fork a safe prefix or start fresh;
+  edited/compacted history without an anchor starts fresh. Optional native metadata preserves v1 journals.
   Compatible active follow-ups interrupt and drain the generation on the same worker; pending
   external tools instead retain a durable instruction queue, folded before inference after actual results.
   Older request replay is resolved before touching active work. Actual started MCP calls hand off
   sequentially without blanket concurrency annotations. Outstanding result conflicts fail closed;
   completed historical outputs use saved authoritative results. Deduplication uses exact call IDs and
   operation receipts; fresh IDs permit repeated user intent with the same tool name and arguments.
-  Native interrupt/drain validation limits, staged recovery, error metadata, and isolation follow
+  Native interrupt/drain, explicit persistent session/resume options, checkpoint validation, staged
+  recovery, error metadata, and isolation follow
   [Claude persistent sessions](../providers/claude-cli-replay.md#persistent-sessions).
   The CLI reads the operator's own sign-in; neither path requires or injects an API key, and the
-  scoped child environment carries no inherited `ANTHROPIC_*` value. Owned stderr is drained and discarded.
+  scoped SDK environment replaces inherited environment; the SDK does not restore host `ANTHROPIC_*`
+  values or OAuth tokens. Custom spawn honors SDK-prepared `launch.env` and `launch.signal`; SDK defaults
+  are not duplicated. Owned stderr is drained and discarded. Shutdown gates MCP successes and failures
+  until closure, requests a bounded interrupt for active MCP calls, then closes SDK input before MCP abort.
+  A bounded exit grace precedes killing only a still-live owned PID tree; replacement awaits the previous
+  close. Receipts and queues remain authoritative over native transcripts.
   Its registry row is `authKind: "key"` with `keyOptional: true`, NOT `local`: the turn leaves the
   machine for `api.anthropic.com`, and `local` (Ollama, vLLM, LM Studio) is the classification for
   traffic that never does. `keyOptional` is the existing exemption from key enforcement, and key

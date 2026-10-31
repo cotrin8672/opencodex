@@ -4,7 +4,8 @@ import { repoPath } from "../helpers/repo-root";
 import { PassThrough } from "node:stream";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { create } from "@bufbuild/protobuf";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { registerOptionalShutdownHook, resetOptionalShutdownHooksForTests } from "../../src/lib/optional-shutdown-hooks";
 import {
   drainAndShutdown,
   registerTurn,
@@ -47,12 +48,13 @@ class ShutdownFakeChild extends EventEmitter {
 afterEach(async () => {
   await resetBackgroundShellStateForTests();
   resetLifecycleDrainStateForTests();
+  resetOptionalShutdownHooksForTests();
 });
 
 function installShutdownShell() {
   const child = new ShutdownFakeChild();
   setBackgroundShellRuntimeForTests({
-    spawn: (() => child as unknown as ChildProcessWithoutNullStreams) as typeof import("node:child_process").spawn,
+    spawn: (() => child as unknown as ChildProcessWithoutNullStreams) as unknown as typeof import("node:child_process").spawn,
     kill: () => true,
   });
   backgroundShellSpawnExec(create(ExecServerMessageSchema, {
@@ -81,6 +83,48 @@ function fakeServer(stopImpl?: (closeActiveConnections?: boolean) => void | Prom
     stopArgs: () => stopArgs,
   };
 }
+
+describe("optional subsystem shutdown join", () => {
+  test("drain waits for async teardown before releasing the listener", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let started!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    let flushed = false;
+    registerOptionalShutdownHook("owned-worker", async () => { started(); await gate; flushed = true; });
+    const fake = fakeServer(() => { expect(flushed).toBe(true); });
+    let settled = false;
+    const draining = drainAndShutdown(fake.server, 1_000).then(result => { settled = true; return result; });
+    try {
+      await entered;
+      await Bun.sleep(0);
+      expect(settled).toBe(false);
+      expect(fake.stops()).toBe(0);
+    } finally { release(); }
+    expect(await draining).toBe(true);
+    expect(fake.stops()).toBe(1);
+  });
+
+  test("a stuck hook cannot renew the absolute deadline or prevent listener/startup release", async () => {
+    const start = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(start);
+    let startupReleased = false;
+    setServerStartupLifecycleReleaseForTests(async () => { startupReleased = true; });
+    registerOptionalShutdownHook("stuck-worker", () => {
+      clock.mockReturnValue(start + 10_000);
+      return new Promise<void>(() => {});
+    });
+    let sibling = false;
+    registerOptionalShutdownHook("sibling", () => { sibling = true; });
+    const fake = fakeServer();
+    try {
+      expect(await drainAndShutdown(fake.server, 10_000)).toBe(false);
+      expect(fake.stops()).toBe(1);
+      expect(startupReleased).toBe(true);
+      expect(sibling).toBe(true);
+    } finally { clock.mockRestore(); }
+  }, 1_000);
+});
 
 describe("server listener shutdown", () => {
   test("single-flights stop(true) and keeps every waiter pending until close completes", async () => {

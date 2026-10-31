@@ -1500,8 +1500,11 @@ CLI headlessly, retaining a native conversation for clients that supply their ow
   vision sidecar on the request path, images are captioned into text before they reach the row.
 - **Isolation:** each worker runs in a scoped child environment with no inherited `ANTHROPIC_*`
   variable (a `claude` already pointed at this proxy therefore cannot loop back into it), telemetry,
-  feedback and the auto-updater disabled. Built-in tools and setting sources are disabled, and strict
-  MCP isolation admits only the client's selected tools. The harness loads no CLAUDE.md, skill,
+  feedback and the auto-updater disabled. That explicit scope replaces the inherited environment;
+  the SDK adds launch metadata without restoring host Anthropic credentials or destinations. The
+  worker preserves the SDK's prepared environment and shutdown signal. Built-in tools and setting
+  sources are disabled, and strict MCP isolation admits only the client's selected tools.
+  The harness loads no CLAUDE.md, skill,
   hook, plugin or other MCP server from the machine; file access, shell commands and browsing
   remain external client actions. Persistent workers drain and discard stderr so verbose private
   diagnostics cannot stall generation; process and stderr-read failures report generic errors.
@@ -1512,11 +1515,16 @@ CLI headlessly, retaining a native conversation for clients that supply their ow
 - **Conversation continuity:** an explicit own `thread-id`, `session_id`, or `session-id` selects
   a persistent worker. Reuse the same identity and client history for that conversation; parent
   thread IDs and prompt-cache keys do not select or share one. Without an own identity, requests
-  retain isolated one-shot compatibility. A cold start or history rebase uses the full stable text
-  projection, trimmed only at message boundaries; later user turns use Claude's native context.
+  retain isolated one-shot compatibility. Each conversation has a separate persisted native Claude
+  session, using the OpenCodex home as a stable working directory. Its native identity is bound to
+  the Claude account, profile and executable. A clean completed session can resume after a proxy
+  restart. Only client-history messages that session has not seen are imported, including turns
+  from GPT, Gemini or other providers; the retained prefix is not sent again.
   A compatible follow-up during generation uses native SDK interruption, waits for the old
-  generation's terminal result, and continues on the same worker. Configuration changes and history
-  rebases require a fresh bootstrap. Conversation IDs remain isolated by
+  generation's terminal result, and continues on the same worker. Editing earlier turns or using
+  Undo forks from the last matching completed checkpoint. Compacted or edited history with no safe
+  checkpoint starts a fresh native session from the latest client history, trimmed only at message
+  boundaries. Missing older native metadata also starts fresh. Conversation IDs remain isolated by
   proxy home, client identity, provider/destination, and conversation versus compaction purpose.
   Claude Code controls prompt-cache breakpoints, so cache savings are not guaranteed.
 - **Follow-ups while tools run:** user instructions are saved in a durable queue while external tool
@@ -1538,8 +1546,14 @@ CLI headlessly, retaining a native conversation for clients that supply their ow
   does not authorize completed replay. Replaying an older request, or refusing its expired receipt,
   is handled before interrupting, stopping, or replacing a newer active generation or its response.
   Session errors retain status, code, retryability and available
-  usage/error-type metadata. After a proxy restart, a fresh worker uses client history and saved results;
-  native SDK session resume is not guaranteed.
+  usage/error-type metadata. During shutdown, pending tool results and errors are held back so they
+  cannot trigger another inference. With active tool calls, OpenCodex first requests a native interrupt,
+  waiting at most one second for acknowledgement, then closes SDK input before cancelling tool waits.
+  It allows two seconds for graceful exit before force-stopping only the still-running owned process tree.
+  Native history is read or forked only after the previous worker closes. A cold session with
+  unfinished generation or tool work forks a prior safe completed checkpoint, or starts fresh;
+  it never resumes an unsafe old tool tail. Saved external results and queued instructions remain
+  authoritative during recovery.
 - **Uncertain tool delivery:** in persistent mode, receipts and a delivery marker are committed to
   the private SQLite journal before calls reach the client. An undelivered handoff can be delivered
   on reconnect only if delivery never started; issued actions are not automatically reissued.
@@ -1556,7 +1570,8 @@ CLI headlessly, retaining a native conversation for clients that supply their ow
   `claude_tool_results_pending` (a 400/409 client error). An issued host action with an unknown result still needs its actual
   result before continuation, including after input changes. Verify whether it ran; do not automatically
   execute it again. Delivery and execution have no exactly-once guarantee.
-  The journal under the OpenCodex home contains private tool arguments, outputs, and queued user instructions.
+  The journal under the OpenCodex home contains private tool arguments, outputs, queued user instructions
+  and native session references. Claude Code also persists the conversation transcript in its selected profile.
 - **Subscription limits:** before each request OpenCodex asks Anthropic's usage endpoint, with the
   CLI's own sign-in read in memory, whether the plan's 5-hour, weekly or model-specific window is
   full. An exhausted plan is refused locally with HTTP 429 `claude_subscription_cooldown` and a

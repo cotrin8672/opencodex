@@ -2,7 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import * as sessionContext from "../../src/adapters/claude-cli/session-context";
 import { claudeDigest, claudeHistory } from "../../src/adapters/claude-cli/session-context";
 import { ClaudeSessionError } from "../../src/adapters/claude-cli/session-errors";
-import { extractClaudeInstructions, restoreClaudeInstructions } from "../../src/adapters/claude-cli/session-instructions";
+import { claudeInstructionContinuation, extractClaudeInstructions, restoreClaudeInstructions } from "../../src/adapters/claude-cli/session-instructions";
 import type { ClaudeQueuedInstruction } from "../../src/adapters/claude-cli/session-journal";
 import type { OcxMessage } from "../../src/types";
 
@@ -65,6 +65,26 @@ describe("extractClaudeInstructions", () => {
       expect(hashHistory).toHaveBeenCalledTimes(2);
       expect(hashHistory.mock.calls.map(([messages]) => messages.length)).toEqual([1001, 1004]);
     } finally { hashHistory.mockRestore(); }
+  });
+});
+
+describe("claudeInstructionContinuation", () => {
+  test("accepts only proven native partial prefixes before new user instructions", () => {
+    const input = [user("Question")];
+    const history = claudeHistory(input);
+    const known = assistant("native partial response");
+    expect(claudeInstructionContinuation([...input, assistant("native "), assistant("partial"), user("Continue")], history, known, new Set())).toBe(true);
+    expect(claudeInstructionContinuation([...input, assistant("foreign answer"), user("Continue")], history, known, new Set())).toBe(false);
+    expect(claudeInstructionContinuation([...input, user("Continue"), assistant("native partial")], history, known, new Set())).toBe(false);
+    expect(claudeInstructionContinuation([...input, prefix[1]!, user("Continue")], history, prefix[1], new Set())).toBe(false);
+  });
+
+  test("pending tools accept only known results and instructions without unseen assistant history", () => {
+    const known = new Set(["call-A"]);
+    expect(claudeInstructionContinuation([...prefix, result, user("Continue")], history, undefined, known)).toBe(true);
+    expect(claudeInstructionContinuation([...prefix, result, assistant("GPT answer"), user("Continue")], history, undefined, known)).toBe(false);
+    expect(claudeInstructionContinuation([...prefix, result], history, undefined, new Set())).toBe(false);
+    expect(claudeInstructionContinuation([user("Changed"), result], history, undefined, known)).toBe(false);
   });
 });
 

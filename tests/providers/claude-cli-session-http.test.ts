@@ -95,7 +95,7 @@ async function withHttp(run: (http: {
     }) });
     expect(oneShotSpawns).toBe(0);
   } finally {
-    h.manager.close();
+    await h.manager.close();
     try {
       await server?.stop(true);
       await flushResponseState();

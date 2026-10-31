@@ -73,6 +73,34 @@ describe("optional shutdown hooks", () => {
     runOptionalShutdownHooks();
     expect(live).toBe(1);
   });
+
+  test("synchronous effects and siblings run immediately while async teardown is joined", async () => {
+    const seen: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    registerOptionalShutdownHook("async", async () => { seen.push("started"); await gate; seen.push("flushed"); });
+    registerOptionalShutdownHook("sibling", () => seen.push("sibling"));
+    let settled = false;
+    const closing = runOptionalShutdownHooks().then(() => { settled = true; });
+    expect(seen).toEqual(["started", "sibling"]);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    release();
+    await closing;
+    expect(seen).toEqual(["started", "sibling", "flushed"]);
+    expect(settled).toBe(true);
+  });
+
+  test("async rejection is observed even when a synchronous caller ignores the join", async () => {
+    let sibling = 0;
+    registerOptionalShutdownHook("rejects", async () => { throw new Error("async teardown failure"); });
+    registerOptionalShutdownHook("sibling", () => { sibling++; });
+    runOptionalShutdownHooks();
+    await Bun.sleep(0);
+    expect(sibling).toBe(1);
+    await expect(runOptionalShutdownHooks()).resolves.toBeUndefined();
+    expect(sibling).toBe(2);
+  });
 });
 
 // Regression: the management API (lab-automation-routes.ts applySchedulerPolicy) and the

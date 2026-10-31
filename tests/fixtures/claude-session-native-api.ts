@@ -69,6 +69,7 @@ function response(body: NativeRequest, reply: NativeReply, ordinal: number): Res
 export function nativeSession(replies: NativeReply[], options: {
   journal?: MemoryJournal;
   interruptWait?: Promise<void>;
+  nativePersistence?: boolean;
 } = {}) {
   assert(nativeBinary, "The packaged native Claude executable is absent");
   assert(isTestHomeGuardArmed() && process.env.OCX_TEST_PRELOAD_PID === String(process.pid), "Load tests/preload.ts from the repo CWD");
@@ -130,8 +131,13 @@ export function nativeSession(replies: NativeReply[], options: {
     SystemRoot: process.env.SystemRoot ?? "C:\\Windows", WINDIR: process.env.WINDIR ?? "C:\\Windows",
     HOMEDRIVE: home.slice(0, 2), HOMEPATH: home.slice(2),
   });
-  const manager = new ClaudeSessionManager({
-    journal, timeoutMs: 15_000, reconnectGraceMs: 30_000,
+  const previousProfile = process.env.CLAUDE_CONFIG_DIR;
+  if (options.nativePersistence) process.env.CLAUDE_CONFIG_DIR = env.CLAUDE_CONFIG_DIR;
+  const createManager = () => new ClaudeSessionManager({
+    journal, timeoutMs: 15_000, reconnectGraceMs: 30_000, nativeDirectory: home,
+    ...(!options.nativePersistence ? { nativeIO: {
+      getSessionMessages: async () => [], forkSession: async () => { throw new Error("Native persistence is disabled in this fixture"); },
+    } } : {}),
     createWorker: workerOptions => createClaudeSessionWorker({ ...workerOptions,
       query: params => {
         assert.deepEqual(params.options?.tools, []);
@@ -166,12 +172,15 @@ export function nativeSession(replies: NativeReply[], options: {
       },
     }),
   });
+  let manager = createManager();
   const input = turn();
   input.binary = nativeBinary;
   input.env = env;
   input.parsed.modelId = "claude-opus-4-6";
   return {
-    input, requests, replied, unexpected, children, requested, resolved, manager, journal,
+    input, requests, replied, unexpected, children, requested, resolved, journal,
+    get manager() { return manager; },
+    async restart() { await manager.close(); manager = createManager(); },
     get maxActive() { return maxActive; },
     get interrupts() { return interrupts; },
     get acknowledgedInterrupts() { return acknowledgedInterrupts; },
@@ -182,16 +191,23 @@ export function nativeSession(replies: NativeReply[], options: {
       return { events, done };
     },
     async close() {
-      try { manager.close(); } finally {
-        shutdown.release();
-        await server.stop(true);
-        for (const child of children) {
-          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      try { await manager.close(); } finally {
+        try {
+          shutdown.release();
+          await server.stop(true);
+          for (const child of children) {
+            if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+          }
+          await nativeUntil(() => children.every(child => child.exitCode !== null || child.signalCode !== null), "owned native processes exit", 3_000);
+          assert.equal(dirname(realpathSync(home)), tempRoot, "Cleanup must stay inside the owned temporary root");
+          assert(home.startsWith(join(tempRoot, "ocx-claude-native-")));
+          rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+        } finally {
+          if (options.nativePersistence && process.env.CLAUDE_CONFIG_DIR === env.CLAUDE_CONFIG_DIR) {
+            if (previousProfile === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+            else process.env.CLAUDE_CONFIG_DIR = previousProfile;
+          }
         }
-        await nativeUntil(() => children.every(child => child.exitCode !== null || child.signalCode !== null), "owned native processes exit", 3_000);
-        assert.equal(dirname(realpathSync(home)), tempRoot, "Cleanup must stay inside the owned temporary root");
-        assert(home.startsWith(join(tempRoot, "ocx-claude-native-")));
-        rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
     },
   };

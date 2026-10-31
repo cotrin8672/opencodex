@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { randomUUID } from "node:crypto";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -65,6 +66,45 @@ function open(): ClaudeSessionJournal {
   journal = openClaudeSessionJournal(path);
   return journal;
 }
+
+test.each([false, true])("round-trips optional native v1 metadata with dirty=%s", dirty => {
+  const saved = snapshot();
+  saved.native = { sessionId: randomUUID(), directory: root, identity: scope, history: saved.history,
+    checkpoints: [{ length: 0, messageId: randomUUID() }, { length: 2, messageId: randomUUID() }], dirty };
+  open().save(scope, saved);
+  journal!.close();
+  expect(open().load(scope)).toEqual(saved);
+});
+
+test("rejects malformed native metadata on writes and backward-compatible v1 reads", () => {
+  const saved = snapshot();
+  const native = { sessionId: randomUUID(), directory: root, identity: scope, history: saved.history,
+    checkpoints: [{ length: 2, messageId: randomUUID() }], dirty: false };
+  const invalid = [null, {}, { ...native, extra: true },
+    ...["", "not-a-uuid", "00000000-0000-0000-0000-000000000000", null, 42].map(sessionId => ({ ...native, sessionId })),
+    ...["", "relative", join(root, "..", "elsewhere") + "/..", root + "\0", null].map(directory => ({ ...native, directory })),
+    ...["bad", "g".repeat(64), null].map(identity => ({ ...native, identity })),
+    ...[["bad"], null, "history"].map(history => ({ ...native, history })),
+    ...[null, "false", 0].map(dirty => ({ ...native, dirty })),
+    ...[-1, 0.5, 3, Number.MAX_SAFE_INTEGER + 1].map(length => ({ ...native, checkpoints: [{ ...native.checkpoints[0], length }] })),
+    ...[null, {}, [{ length: 2, messageId: "bad" }], [{ length: 2, messageId: randomUUID(), extra: true }],
+      Array.from({ length: 65 }, () => native.checkpoints[0])].map(checkpoints => ({ ...native, checkpoints })),
+  ];
+  open().save(scope, saved);
+  database = new Database(path);
+  const replace = database.query("UPDATE claude_sessions SET payload = ? WHERE scope = ?");
+  for (const value of invalid) {
+    replace.run(JSON.stringify(saved), scope);
+    const malformed = { ...saved, native: value } as unknown as ClaudeSessionSnapshot;
+    expect(() => journal!.save(scope, malformed)).toThrow("save failed");
+    expect(journal!.load(scope)).toEqual(saved);
+    replace.run(JSON.stringify(malformed), scope);
+    expect(() => journal!.load(scope)).toThrow("load failed");
+  }
+  saved.native = { ...native, checkpoints: Array.from({ length: 64 }, () => ({ length: 2, messageId: randomUUID() })) };
+  journal!.save(scope, saved);
+  expect(journal!.load(scope)).toEqual(saved);
+});
 
 test("commits before returning, reopens durably, and isolates scopes", () => {
   const first = open();

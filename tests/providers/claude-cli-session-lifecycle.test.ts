@@ -99,7 +99,7 @@ describe("Claude session interruption and recovery", () => {
     first.worker.mcp(action);
     await first.worker.blocks([action]);
     expect(journal.load(input.scope)!.turns[0]!.deliveryStarted).not.toBe(true);
-    if (cold) { h.manager.close(); h = harness(journal); }
+    if (cold) { await h.manager.close(); h = harness(journal); }
     const next = await h.start(withMessages(input, [user("replacement prompt")]));
     await next.worker.finish("replacement answer");
     await next.done;
@@ -186,7 +186,7 @@ describe("Claude session interruption and recovery", () => {
       .rejects.toThrow("dispatch refused");
     await expect(pending).rejects.toThrow("worker stopped");
     expect(journal.load(input.scope)!.turns[0]!.phase).toBe("tools");
-    h.manager.close();
+    await h.manager.close();
     const reopened = harness(journal);
     const recovered = await reopened.start(withMessages(input, [...history, user("continue")]));
     expect(recovered.worker.sends[0]).toContain("UNIQUE_SAVED_OUTPUT");

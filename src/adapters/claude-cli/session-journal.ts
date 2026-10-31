@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { chmodSync, closeSync, lstatSync, openSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import * as z from "zod/v4";
 import { getConfigDir } from "../../config/paths";
 import { assertNotRealHomeUnderTest } from "../../lib/test-home-guard";
@@ -36,11 +36,21 @@ export interface ClaudeQueuedInstruction {
   updatedAt: number;
 }
 
+export interface ClaudeNativeSession {
+  sessionId: string;
+  directory: string;
+  identity: string;
+  history: string[];
+  checkpoints: Array<{ length: number; messageId: string }>;
+  dirty: boolean;
+}
+
 export interface ClaudeSessionSnapshot {
   version: 1;
   history: string[];
   turns: ClaudeTurnReceipt[];
   instructions?: ClaudeQueuedInstruction[];
+  native?: ClaudeNativeSession;
 }
 
 export interface ClaudeSessionJournal {
@@ -51,6 +61,13 @@ export interface ClaudeSessionJournal {
 
 const MAX_RECORD_BYTES = 16 * 1024 * 1024;
 const hash = z.string().length(64).regex(/^[0-9a-f]+$/i);
+const nativeUuid = z.uuid().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+export const claudeNativeSessionSchema: z.ZodType<ClaudeNativeSession> = z.strictObject({
+  sessionId: nativeUuid,
+  directory: z.string().min(1).refine(path => !path.includes("\0") && isAbsolute(path) && resolve(path) === path),
+  identity: hash, history: z.array(hash), dirty: z.boolean(),
+  checkpoints: z.array(z.strictObject({ length: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), messageId: nativeUuid })).max(64),
+}).refine(native => native.checkpoints.every(checkpoint => checkpoint.length <= native.history.length));
 const count = z.number().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const usage = z.strictObject({
   inputTokens: count, outputTokens: count,
@@ -100,6 +117,7 @@ const eventSchemas = {
 } satisfies { [Type in AdapterEvent["type"]]: z.ZodType<Extract<AdapterEvent, { type: Type }>> };
 const snapshotSchema: z.ZodType<ClaudeSessionSnapshot> = z.strictObject({
   version: z.literal(1), history: z.array(hash),
+  native: claudeNativeSessionSchema.optional(),
   instructions: z.array(z.strictObject({
     inputHash: hash, operationId: hash.optional(), history: z.array(hash),
     texts: z.array(z.string().min(1).max(MAX_RECORD_BYTES)).min(1).max(64),

@@ -525,7 +525,7 @@ export async function drainAndShutdown(
   const s = server ?? _serverRef;
   let shutdownSucceeded = true;
   // One absolute budget covers both a pre-existing scoped profile drain and
-  // ordinary in-flight turns. A stuck scoped owner must not pin shutdown forever.
+  // ordinary in-flight turns and optional teardown. A stuck owner must not pin shutdown forever.
   const deadline = Date.now() + Math.max(0, timeoutMs);
   beginShutdownDrain();
   runDrainStartHooks();
@@ -573,7 +573,7 @@ export async function drainAndShutdown(
     // Optional subsystems (Compatibility Lab today, anything added later) tear themselves
     // down through hooks registered at activation. A process that never activated one runs
     // nothing here and never loads its module graph.
-    runOptionalShutdownHooks();
+    const optionalShutdown = runOptionalShutdownHooks();
     stopStateStoreSweeper();
     // The overlay reconciler is owner-scoped: the startServer stop override
     // releases THIS server's lease through runListenerShutdown →
@@ -604,6 +604,19 @@ export async function drainAndShutdown(
     }
     setStorageCleanupPolicyLiveSink(null);
     setStorageCleanupPolicyJobLiveApply(null);
+    let optionalTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const optionalSettled = await Promise.race([
+        optionalShutdown.then(() => true),
+        new Promise<boolean>(resolve => {
+          optionalTimer = setTimeout(() => resolve(false), Math.max(0, deadline - Date.now()));
+        }),
+      ]);
+      if (!optionalSettled) {
+        shutdownSucceeded = false;
+        console.warn("Optional subsystem teardown did not settle before the shutdown deadline; forcing shutdown");
+      }
+    } finally { clearTimeout(optionalTimer); }
   } finally {
     try {
       // Signal cleanup restores owned client routing while this listener still owns its port.

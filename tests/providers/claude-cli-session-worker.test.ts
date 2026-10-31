@@ -3,7 +3,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolResultSchema, ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, test } from "bun:test";
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import { createClaudeSessionWorker, type ClaudeSessionWorker, type ClaudeWorkerOptions } from "../../src/adapters/claude-cli/session-worker";
@@ -20,7 +20,7 @@ const tool: CodingAgentMcpTool = {
   },
 };
 const active: ClaudeSessionWorker[] = [];
-afterEach(() => { for (const worker of active.splice(0)) worker.stop(); });
+afterEach(async () => { await Promise.all(active.splice(0).map(worker => worker.stop())); });
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -29,7 +29,7 @@ function deferred<T>() {
 }
 
 async function until(check: () => boolean): Promise<void> {
-  for (let i = 0; i < 200; i++) {
+  for (let i = 0; i < 800; i++) {
     if (check()) return;
     await Bun.sleep(5);
   }
@@ -46,7 +46,7 @@ async function harness(overrides: Partial<ClaudeWorkerOptions> = {}, onInterrupt
   let closeCalls = 0;
   const client = new Client({ name: "offline-worker-test", version: "1.0.0" });
   const errors: Error[] = [];
-  const messages: Record<string, unknown>[] = [];
+  const messages: SDKMessage[] = [];
   let ready!: Promise<void>;
   const output = new ReadableStream<SDKMessage>({ start(value) { controller = value; } });
   const fakeQuery: typeof officialQuery = params => {
@@ -202,7 +202,7 @@ describe("Claude SDK persistent session worker", () => {
 
   test("interrupt errors propagate without shutting down the worker; stopped interrupts reject", async () => {
     const h = await harness({}, async () => { throw new Error("SDK interrupt rejected"); });
-    await expect(h.worker.interrupt()).rejects.toThrow("SDK interrupt rejected");
+    await expect(h.worker.interrupt()).rejects.toThrow("Claude CLI interrupt failed");
     expect(h.closeCalls()).toBe(0);
     h.worker.send("still usable");
     expect((await h.input.next()).value.message.content).toBe("still usable");
@@ -214,7 +214,7 @@ describe("Claude SDK persistent session worker", () => {
 
   test("keeps one input stream alive across two results and delivers messages sequentially", async () => {
     const gate = deferred<void>();
-    const seen: Record<string, unknown>[] = [];
+    const seen: SDKMessage[] = [];
     const h = await harness({ onMessage: async message => {
       seen.push(message);
       if (seen.length === 1) await gate.promise;
@@ -326,7 +326,7 @@ describe("Claude SDK persistent session worker", () => {
     expect(h.errors).toHaveLength(1);
   });
 
-  test("isolates SDK options and the actual custom-spawn environment", async () => {
+  test("preserves SDK-prepared launch env within the scoped environment", async () => {
     const h = await harness({ env: { ONLY_SCOPED: "yes", CLAUDECODE: "parent-proxy" } });
     expect(h.options).toMatchObject({
       pathToClaudeCodeExecutable: process.execPath,
@@ -340,14 +340,18 @@ describe("Claude SDK persistent session worker", () => {
     expect(h.options.allowDangerouslySkipPermissions).toBeUndefined();
     expect(Object.keys(h.options.mcpServers!)).toEqual(["opencodex"]);
     const env = h.options.env!;
+    expect(env.CLAUDE_CODE_ENTRYPOINT).toBeUndefined();
+    expect(env.CLAUDE_AGENT_SDK_VERSION).toBeUndefined();
+    expect(env.CLAUDE_CODE_SDK_READS_SESSION_STATE).toBeUndefined();
     expect(env.CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS).toBe("0");
     expect(Number(env.MCP_TOOL_TIMEOUT)).toBeGreaterThanOrEqual(3_600_000);
     expect(Number(env.MCP_TOOL_TIMEOUT)).toBeLessThanOrEqual(86_400_000);
     const child = h.options.spawnClaudeCodeProcess!({
       command: process.execPath,
       args: ["-e", "process.stdout.write(JSON.stringify(process.env))"],
-      env: { ANTHROPIC_API_KEY: "inherited-test-only", CLAUDE_CODE_OAUTH_TOKEN: "inherited-test-only",
-        CLAUDECODE: "proxy", HTTP_PROXY: "unscoped", ...env },
+      env: { ...env, SDK_PREPARED: "honored", CLAUDECODE: "proxy",
+        CLAUDE_CODE_ENTRYPOINT: "sdk-ts", CLAUDE_AGENT_SDK_VERSION: "sdk-owned-version",
+        CLAUDE_CODE_SDK_READS_SESSION_STATE: "1" },
       signal: new AbortController().signal,
     });
     const text = await new Response(child.stdout as unknown as ReadableStream).text();
@@ -357,12 +361,124 @@ describe("Claude SDK persistent session worker", () => {
     expect(actual.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     expect(actual.CLAUDECODE).toBeUndefined();
     expect(actual.HTTP_PROXY).toBeUndefined();
+    expect(actual.OCX_TEST_PRELOAD_PID).toBeUndefined();
+    expect(actual.SDK_PREPARED).toBe("honored");
+    expect(actual.CLAUDE_CODE_ENTRYPOINT).toBe("sdk-ts");
+    expect(actual.CLAUDE_AGENT_SDK_VERSION).toBe("sdk-owned-version");
+    expect(actual.CLAUDE_CODE_SDK_READS_SESSION_STATE).toBe("1");
     for (const [key, value] of Object.entries(env)) expect(actual[key]).toBe(value);
-    expect(() => h.options.spawnClaudeCodeProcess!({
+    const guarded = await harness();
+    expect(() => guarded.options.spawnClaudeCodeProcess!({
       command: process.execPath, args: ["--system-prompt=private"], env: {},
       signal: new AbortController().signal,
     })).toThrow("stdin");
   });
+
+  test.each([{}, { sessionId: "11111111-1111-4111-8111-111111111111" }, { resume: "22222222-2222-4222-8222-222222222222" }])(
+    "passes explicit cwd and persistence/session options to the SDK: %j", async identity => {
+      const h = await harness({ cwd: fixturePath("."), persistSession: true, ...identity });
+      expect(h.options).toMatchObject({ cwd: fixturePath("."), persistSession: true, ...identity });
+    },
+  );
+
+  test("rejects sessionId plus resume before calling the SDK", async () => {
+    let launched = false;
+    await expect(harness({ sessionId: "private-new", resume: "private-resume", query: () => {
+      launched = true; throw new Error("must not launch");
+    } })).rejects.toThrow("mutually exclusive");
+    expect(launched).toBe(false);
+  });
+
+  test("sanitizes synchronous SDK launch failures", async () => {
+    const errors: Error[] = [];
+    await expect(harness({ query: () => { throw new Error("private prompt and credentials"); },
+      onError: error => { errors.push(error); },
+    })).rejects.toThrow("Claude CLI session launch failed");
+    expect(errors.map(error => error.message)).toEqual(["Claude CLI session launch failed"]);
+  });
+
+  test("sanitizes rejected external tool calls", async () => {
+    const h = await harness({ onToolCall: async () => { throw new Error("private tool arguments and credentials"); } });
+    const result = await h.call("toolu_failed").then(value => JSON.stringify(value), error => String(error));
+    expect(result).not.toContain("private tool");
+    expect(h.errors.map(error => error.message)).toEqual(["Claude MCP tool call failed"]);
+  });
+
+  test("honors the SDK launch signal without aborting unrelated children", async () => {
+    const h = await harness();
+    const controller = new AbortController();
+    const unrelated = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { windowsHide: true, stdio: "ignore" });
+    try {
+      const child = h.options.spawnClaudeCodeProcess!({ command: process.execPath,
+        args: ["-e", "process.stdout.write('ready'); setInterval(() => {}, 1000)"],
+        env: {}, signal: controller.signal,
+      });
+      await new Promise<void>(resolve => { child.stdout.once("data", () => resolve()); });
+      const exited = new Promise<void>(resolve => { child.once("exit", () => resolve()); });
+      controller.abort(new Error("private abort reason"));
+      await exited;
+      await h.worker.stop();
+      expect(unrelated.exitCode).toBeNull();
+      expect(unrelated.signalCode).toBeNull();
+      expect(h.errors.map(error => error.message)).toEqual(["Claude CLI process failed"]);
+    } finally { unrelated.kill("SIGKILL"); }
+  });
+
+  test.each([false, true])("stop is concurrent/reentrant-safe and waits for owned exit (hung=%s)", async hung => {
+    const h = await harness();
+    const code = hung
+      ? "process.stdout.write('ready'); setInterval(() => {}, 1000)"
+      : "process.stdin.resume(); process.stdin.on('end', () => setTimeout(() => process.exit(0), 100)); process.stdout.write('ready')";
+    const child = h.options.spawnClaudeCodeProcess!({ command: process.execPath, args: ["-e", code],
+      env: {}, signal: new AbortController().signal,
+    });
+    await new Promise<void>(resolve => { child.stdout.once("data", () => resolve()); });
+    const started = Date.now();
+    const closing = h.worker.stop();
+    expect(h.worker.stop()).toBe(closing);
+    child.stderr.emit("error", new Error("private cleanup recursion"));
+    expect(h.worker.stop()).toBe(closing);
+    expect(child.exitCode).toBeNull();
+    await closing;
+    expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+    expect(h.closeCalls()).toBe(1);
+    expect(h.errors).toEqual([]);
+    expect(h.worker.stop()).toBe(closing);
+    if (hung) {
+      expect(Date.now() - started).toBeGreaterThanOrEqual(1_900);
+      expect(Date.now() - started).toBeLessThan(6_000);
+    } else {
+      expect(child.exitCode).toBe(0);
+      expect(child.signalCode).toBeNull();
+    }
+  }, 10_000);
+
+  test.skipIf(process.platform !== "win32")("force-kills only the owned PID tree, including its descendant", async () => {
+    const h = await harness();
+    const unrelated = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { windowsHide: true, stdio: "ignore" });
+    let descendant: number | undefined;
+    const exists = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      const child = h.options.spawnClaudeCodeProcess!({ command: process.execPath, args: ["-e",
+        "const {spawn}=require('node:child_process'); const child=spawn(process.execPath,['-e','setInterval(() => {}, 1000)'],{stdio:'ignore',windowsHide:true}); process.stdout.write(String(child.pid)); setInterval(() => {}, 1000)",
+      ], env: {}, signal: new AbortController().signal });
+      descendant = Number(await new Promise<string>(resolve => { child.stdout.once("data", chunk => resolve(String(chunk))); }));
+      expect(Number.isSafeInteger(descendant) && descendant > 0).toBe(true);
+      expect(exists(descendant)).toBe(true);
+      expect(() => h.options.spawnClaudeCodeProcess!({ command: process.execPath, args: [], env: {},
+        signal: new AbortController().signal,
+      })).toThrow("already owns a process");
+      await h.worker.stop();
+      await until(() => !exists(descendant!));
+      expect(unrelated.exitCode).toBeNull();
+      expect(unrelated.signalCode).toBeNull();
+      expect(h.errors).toEqual([]);
+    } finally {
+      await h.worker.stop();
+      unrelated.kill("SIGKILL");
+      if (descendant && exists(descendant)) process.kill(descendant, "SIGKILL");
+    }
+  }, 10_000);
 
   test("stop aborts pending tool results, ends stdin and emits no error", async () => {
     let callSignal: AbortSignal | undefined;
@@ -374,14 +490,54 @@ describe("Claude SDK persistent session worker", () => {
     const rejected = result.then(() => null, error => error);
     await until(() => callSignal !== undefined);
     const inputEnd = h.input.next();
-    h.worker.stop();
-    h.worker.stop();
+    const closing = h.worker.stop();
+    expect(h.worker.stop()).toBe(closing);
+    await closing;
     expect(callSignal!.aborted).toBe(true);
     expect((await inputEnd).done).toBe(true);
     expect(await rejected).toBeInstanceOf(Error);
     await Bun.sleep(0);
     expect(h.errors).toEqual([]);
     await expect(h.worker.updateTools([])).rejects.toThrow("stopped");
+  });
+
+  test("stop gates detached MCP rejection until native interrupt acknowledges and SDK input closes", async () => {
+    const ack = deferred<void>();
+    let reject!: (error: Error) => void;
+    let signal: AbortSignal | undefined;
+    const receipt = new Promise<Awaited<ReturnType<ClaudeWorkerOptions["onToolCall"]>>>((_resolve, fail) => { reject = fail; });
+    const h = await harness({ onToolCall: async (_call, value) => { signal = value; return receipt; } }, () => ack.promise);
+    let settled = false;
+    const call = h.call("toolu_stop_order").then(() => { settled = true; }, () => { settled = true; });
+    await until(() => signal !== undefined);
+    const closing = h.worker.stop();
+    reject(new Error("Detached manager settlement"));
+    await until(() => h.interruptCalls() === 1);
+    await Bun.sleep(0);
+    expect(settled).toBe(false);
+    expect(h.closeCalls()).toBe(0);
+    expect(signal!.aborted).toBe(false);
+    ack.resolve();
+    await closing;
+    await call;
+    expect(h.closeCalls()).toBe(1);
+    expect(signal!.aborted).toBe(true);
+    expect(h.errors).toEqual([]);
+  });
+
+  test.each(["error", "timeout"])("pending MCP shutdown stays bounded when native interrupt %s prevents acknowledgement", async mode => {
+    let signal: AbortSignal | undefined;
+    const h = await harness({ onToolCall: async (_call, value) => { signal = value; return new Promise(() => {}); } },
+      async () => { if (mode === "error") throw new Error("Private control failure"); await new Promise(() => {}); });
+    const call = h.call("toolu_stop_no_ack").catch(error => error);
+    await until(() => signal !== undefined);
+    const started = Date.now();
+    await h.worker.stop();
+    expect(Date.now() - started).toBeLessThan(2_500);
+    expect(await call).toBeInstanceOf(Error);
+    expect(signal!.aborted).toBe(true);
+    expect(h.closeCalls()).toBe(1);
+    expect(h.errors).toEqual([]);
   });
 
   test("interrupt preserves its owned running native process and only stop shuts it down", async () => {
@@ -408,7 +564,7 @@ describe("Claude SDK persistent session worker", () => {
     const prompt = "Private offline initialize marker";
     let initializePrompt: unknown;
     let argv: string[] = [];
-    const messages: Record<string, unknown>[] = [];
+    const messages: SDKMessage[] = [];
     const errors: Error[] = [];
     const sent: Record<string, unknown>[] = [];
     const controls: string[] = [];
@@ -483,7 +639,7 @@ describe("Claude SDK persistent session worker", () => {
     expect(messages.filter(message => message.type === "result")).toHaveLength(1);
     expect(closed).toBe(false);
     rejectInterrupt = true;
-    await expect(worker.interrupt()).rejects.toThrow("native interrupt refused");
+    await expect(worker.interrupt()).rejects.toThrow("Claude CLI interrupt failed");
     expect(closed).toBe(false);
     worker.send("offline follow-up", { uuid: "aabbccdd-1234-4567-890a-aabbccddeeff", shouldQuery: false, priority: "next" });
     await until(() => sent.length === 2);
@@ -494,7 +650,7 @@ describe("Claude SDK persistent session worker", () => {
 
   test("drains a real owned child's stderr through the installed SDK without blocking results", async () => {
     let child!: ChildProcessWithoutNullStreams;
-    const result = deferred<Record<string, unknown>>();
+    const result = deferred<SDKMessage>();
     const errors: Error[] = [];
     const worker = await createClaudeSessionWorker({
       binary: process.execPath, model: "offline-model", systemPrompt: "Private offline prompt", env: {}, tools: [],
@@ -561,7 +717,7 @@ describe("Claude SDK persistent session worker", () => {
     if (mode === "end") h.end();
     else h.error(new Error("SDK process exited with code 7"));
     await until(() => h.errors.length === 1);
-    expect(h.errors[0].message).toContain(mode === "end" ? "ended unexpectedly" : "code 7");
+    expect(h.errors[0].message).toBe(mode === "end" ? "Claude CLI session ended unexpectedly" : "Claude CLI session failed");
     h.worker.stop();
     await Bun.sleep(0);
     expect(h.errors).toHaveLength(1);

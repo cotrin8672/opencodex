@@ -1,4 +1,4 @@
-import { query as sdkQuery, type Query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query as sdkQuery, type Query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
@@ -16,9 +16,13 @@ export interface ClaudeWorkerOptions {
   model: string;
   systemPrompt: string;
   env: Record<string, string>;
+  cwd?: string;
+  sessionId?: string;
+  resume?: string;
+  persistSession?: boolean;
   effort?: string;
   tools: CodingAgentMcpTool[];
-  onMessage: (message: Record<string, unknown>) => void | Promise<void>;
+  onMessage: (message: SDKMessage) => void | Promise<void>;
   onToolCall: (call: ClaudeWorkerToolCall, signal: AbortSignal) => Promise<{
     content: Array<{ type: "text"; text: string }>;
     isError?: boolean;
@@ -42,33 +46,36 @@ export interface ClaudeSessionWorker {
    */
   interrupt(): Promise<void>;
   updateTools(tools: CodingAgentMcpTool[]): Promise<void>;
-  stop(): void;
+  stop(): void | Promise<void>;
 }
 
 const SERVER_NAME = "opencodex";
-const SDK_ENV = {
-  CLAUDE_CODE_ENTRYPOINT: "sdk-ts",
-  CLAUDE_AGENT_SDK_VERSION: "0.3.314",
-  CLAUDE_CODE_SDK_READS_SESSION_STATE: "1",
+const BRIDGE_ENV = {
   CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS: "0",
   MCP_TOOL_TIMEOUT: "86400000",
 };
 
 export async function createClaudeSessionWorker(options: ClaudeWorkerOptions): Promise<ClaudeSessionWorker> {
+  if (options.sessionId !== undefined && options.resume !== undefined) {
+    throw new Error("Claude worker sessionId and resume are mutually exclusive");
+  }
   const effort = options.effort;
   if (effort !== undefined && effort !== "low" && effort !== "medium" && effort !== "high"
     && effort !== "xhigh" && effort !== "max") throw new Error("Unsupported Claude worker effort");
 
   const env = {
     ...Object.fromEntries(Object.entries(options.env).filter(([key]) =>
-      key.toUpperCase() !== "CLAUDECODE" && !(key.toUpperCase() in SDK_ENV))),
-    ...SDK_ENV,
+      key.toUpperCase() !== "CLAUDECODE" && !(key.toUpperCase() in BRIDGE_ENV))),
+    ...BRIDGE_ENV,
   };
+  // Cancel MCP waits independently so SDK shutdown retains its stdin grace.
   const abort = new AbortController();
   const input: Array<{ frame: SDKUserMessage; resolve: () => void; reject: (error: Error) => void }> = [];
   const pendingWrites = new Set<(error: Error) => void>();
   let wake: (() => void) | undefined;
   let stopped = false;
+  let closing: Promise<void> | undefined;
+  let activeMcp = 0;
   let session: Query | undefined;
   let child: ChildProcess | undefined;
   let tools = [...options.tools];
@@ -77,39 +84,80 @@ export async function createClaudeSessionWorker(options: ClaudeWorkerOptions): P
     capabilities: { tools: { listChanged: true } },
   });
 
-  function stop(): void {
-    if (stopped) return;
+  function alive(owned: ChildProcess | undefined): owned is ChildProcess & { pid: number } {
+    return !!owned?.pid && owned.exitCode === null && owned.signalCode === null;
+  }
+
+  async function waitForExit(owned: ChildProcess | undefined): Promise<void> {
+    if (!alive(owned)) return;
+    await new Promise<void>(resolve => {
+      const done = () => {
+        clearTimeout(timer);
+        owned.off("exit", done);
+        owned.off("close", done);
+        resolve();
+      };
+      const timer = setTimeout(done, 2_000);
+      owned.once("exit", done);
+      owned.once("close", done);
+    });
+  }
+
+  function stop(): Promise<void> {
+    if (closing) return closing;
     stopped = true;
+    // Publish the promise before cleanup can synchronously re-enter stop().
+    closing = Promise.resolve().then(async () => {
+      if (activeMcp && session) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([session.interrupt(), new Promise<void>(resolve => {
+            timer = setTimeout(resolve, 1_000);
+          })]);
+        } catch { /* Broken control transport still needs bounded shutdown. */ }
+        finally { clearTimeout(timer); }
+      }
+      try { session?.close(); } catch { /* Still close input if SDK cleanup fails. */ }
+      const owned = child;
+      try { owned?.stdin?.end(); } catch { /* The input may already be closed. */ }
+      abort.abort(new Error("Claude session worker stopped"));
+      void mcp.close().catch(() => {});
+      await waitForExit(owned);
+      // Only force our still-live process tree after stdin EOF has had its grace.
+      if (alive(owned)) {
+        try {
+          if (process.platform === "win32") {
+            const taskkill = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`;
+            execFileSync(taskkill, ["/PID", String(owned.pid), "/T", "/F"], {
+              env, stdio: "ignore", windowsHide: true, timeout: 2_000,
+            });
+          } else {
+            process.kill(-owned.pid, "SIGKILL");
+          }
+        } catch {
+          if (alive(owned)) {
+            try { owned.kill("SIGKILL"); } catch { /* The owned child already exited. */ }
+          }
+        }
+        await waitForExit(owned);
+        if (alive(owned)) throw new Error("Claude CLI process shutdown failed");
+      }
+    });
+    // Compatible fire-and-forget owners must not cause an unhandled rejection.
+    void closing.catch(() => {});
     const error = new Error("Claude session worker stopped");
     for (const reject of pendingWrites) reject(error);
     pendingWrites.clear();
     input.length = 0;
     wake?.();
     wake = undefined;
-    abort.abort(error);
-    // Kill only our still-live child (and its descendants), never a discovered user CLI.
-    if (child?.pid && child.exitCode === null && child.signalCode === null) {
-      try {
-        if (process.platform === "win32") {
-          const taskkill = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`;
-          execFileSync(taskkill, ["/PID", String(child.pid), "/T", "/F"], {
-            env, stdio: "ignore", windowsHide: true, timeout: 2_000,
-          });
-        } else {
-          process.kill(-child.pid, "SIGKILL");
-        }
-      } catch {
-        try { child.kill("SIGKILL"); } catch { /* The owned child already exited. */ }
-      }
-    }
-    try { session?.close(); } catch { /* Cancellation must finish even if SDK cleanup fails. */ }
-    void mcp.close().catch(() => {});
+    return closing;
   }
 
-  function fail(error: unknown): void {
+  function fail(error: Error): void {
     if (stopped) return;
     stop();
-    options.onError(error instanceof Error ? error : new Error(String(error)));
+    options.onError(error);
   }
 
   mcp.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
@@ -129,15 +177,22 @@ export async function createClaudeSessionWorker(options: ClaudeWorkerOptions): P
       onAbort = () => reject(signal.reason);
       signal.addEventListener("abort", onAbort, { once: true });
     });
+    activeMcp++;
     try {
-      return await Promise.race([
+      const result = await Promise.race([
         options.onToolCall({ id, name: request.params.name, arguments: args }, signal),
         cancelled,
       ]);
-    } catch (error) {
+      // Detached owner settlements must not become CLI tool results during shutdown.
+      if (stopped) await closing;
+      return result;
+    } catch {
+      if (stopped) await closing;
+      const error = new Error("Claude MCP tool call failed");
       if (!signal.aborted) fail(error);
       throw error;
     } finally {
+      activeMcp--;
       signal.removeEventListener("abort", onAbort!);
     }
   });
@@ -159,34 +214,43 @@ export async function createClaudeSessionWorker(options: ClaudeWorkerOptions): P
       prompt: userFrames(),
       options: {
         pathToClaudeCodeExecutable: options.binary,
+        cwd: options.cwd,
+        sessionId: options.sessionId,
+        resume: options.resume,
         model: options.model,
         // SDK 0.3.314 sends this through initialize on stdin, never argv.
         systemPrompt: options.systemPrompt,
         verbatimPrompts: true,
         effort,
         env: { ...env },
-        abortController: abort,
         tools: [],
         includePartialMessages: true,
         strictMcpConfig: true,
         settingSources: [],
         allowedTools: [`mcp__${SERVER_NAME}__*`],
-        persistSession: false,
+        persistSession: options.persistSession ?? false,
         mcpServers: { [SERVER_NAME]: { type: "sdk", name: SERVER_NAME, instance: mcp } },
         spawnClaudeCodeProcess: launch => {
           if (stopped) throw new Error("Claude session worker stopped");
+          if (child) throw new Error("Claude worker already owns a process");
           if (launch.args.some(arg => /^--(?:append-)?system-prompt(?:=|$)/.test(arg))) {
             throw new Error("Claude worker system prompt must travel through stdin");
           }
           const ownedChild = spawn(launch.command, launch.args, {
             cwd: launch.cwd,
-            env: { ...env },
+            env: {
+              ...Object.fromEntries(Object.entries(launch.env).filter(([key]) =>
+                key.toUpperCase() !== "CLAUDECODE" && !(key.toUpperCase() in BRIDGE_ENV))),
+              ...BRIDGE_ENV,
+            },
+            signal: launch.signal,
             stdio: "pipe",
             windowsHide: true,
             detached: process.platform !== "win32",
           });
           child = ownedChild;
           ownedChild.on("error", () => fail(new Error("Claude CLI process failed")));
+          ownedChild.stdin.on("error", () => fail(new Error("Claude CLI input write failed")));
           ownedChild.stderr.on("error", () => fail(new Error("Claude CLI stderr read failed")));
           // Custom SDK spawns must drain stderr; discard it to keep diagnostics private.
           ownedChild.stderr.resume();
@@ -194,7 +258,8 @@ export async function createClaudeSessionWorker(options: ClaudeWorkerOptions): P
         },
       },
     });
-  } catch (error) {
+  } catch {
+    const error = new Error("Claude CLI session launch failed");
     fail(error);
     throw error;
   }
@@ -202,12 +267,12 @@ export async function createClaudeSessionWorker(options: ClaudeWorkerOptions): P
   void (async () => {
     try {
       for await (const message of session!) {
-        if (stopped) return;
-        await options.onMessage(message as unknown as Record<string, unknown>);
+        if (stopped) continue;
+        await options.onMessage(message);
       }
       fail(new Error("Claude CLI session ended unexpectedly"));
-    } catch (error) {
-      fail(error);
+    } catch {
+      fail(new Error("Claude CLI session failed"));
     }
   })();
 
@@ -243,7 +308,8 @@ export async function createClaudeSessionWorker(options: ClaudeWorkerOptions): P
     },
     async interrupt() {
       if (stopped) throw new Error("Claude session worker stopped");
-      await session!.interrupt();
+      try { await session!.interrupt(); }
+      catch { throw new Error("Claude CLI interrupt failed"); }
     },
     async updateTools(updated) {
       if (stopped) throw new Error("Claude session worker stopped");

@@ -7,6 +7,48 @@ const nextUuid = "33333333-3333-4333-8333-333333333333";
 const text = (text: string) => ({ type: "text" as const, text });
 
 describe.skipIf(!workerNativeBinary)("Claude worker native follow-up contract (SDK 0.3.314 / CLI 2.1.314)", () => {
+  test.each(["reject", "resolve", "abort"])("stop during pending MCP never starts another inference (settlement=%s)", async settlement => {
+    let started = false;
+    let signal!: AbortSignal;
+    let resolve!: (value: { content: Array<{ type: "text"; text: string }> }) => void;
+    let reject!: (error: Error) => void;
+    const receipt = new Promise<{ content: Array<{ type: "text"; text: string }> }>((done, fail) => { resolve = done; reject = fail; });
+    const h = await nativeWorker([
+      { content: [{ type: "tool_use", id: "toolu_worker_shutdown", name: "mcp__opencodex__run", input: {} }] },
+    ], async (_call, value) => { signal = value; started = true; return receipt; });
+    try {
+      await h.worker.send("pending external operation", { uuid: firstUuid });
+      await workerUntil(() => started, "pending shutdown tool");
+      expect(h.requests).toHaveLength(1);
+      const closing = h.worker.stop();
+      if (settlement === "reject") reject(new Error("Detached manager pending promise rejected"));
+      if (settlement === "resolve") resolve({ content: [text("Late external result")] });
+      await closing;
+      expect(signal.aborted).toBe(true);
+      expect(h.requests).toHaveLength(1);
+      expect(h.unexpected).toEqual([]);
+      expect(h.children[0]!.exitCode).not.toBeNull();
+      expect(h.children[0]!.killed).toBe(false);
+      expect(h.children[0]!.signalCode).toBeNull();
+      expect(h.errors).toEqual([]);
+    } finally { resolve({ content: [] }); await h.close(); }
+  }, 15_000);
+
+  test("stop allows native stdin shutdown to exit cleanly before resolving", async () => {
+    const h = await nativeWorker([{ content: [text("ready to close")] }]);
+    try {
+      await h.worker.send("one turn", { uuid: firstUuid });
+      await workerUntil(() => h.messages.some(frame => frame.type === "result"), "native result");
+      const closing = h.worker.stop();
+      expect(h.worker.stop()).toBe(closing);
+      await closing;
+      expect(h.children).toHaveLength(1);
+      expect(h.children[0]!.exitCode).toBe(0);
+      expect(h.children[0]!.signalCode).toBeNull();
+      expect(h.errors).toEqual([]);
+    } finally { await h.close(); }
+  }, 15_000);
+
   test.each([false, true])("proves shouldQuery:true queue correlation (pending MCP=%s)", async pendingMcp => {
     const held = workerGate();
     let toolStarted = false;

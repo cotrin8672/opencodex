@@ -75,7 +75,7 @@ test("completed restored responses replay for the raw request both before and af
   expect(replay.events).toContainEqual({ type: "text_delta", text: "recovered final answer" });
   expect(h.workers).toHaveLength(1);
   expect(recovered.worker.sends).toHaveLength(1);
-  h.manager.close();
+  await h.manager.close();
   const restarted = harness(journal);
   const coldReplay = restarted.run(rebased);
   await coldReplay.done;

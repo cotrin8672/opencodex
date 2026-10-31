@@ -5,6 +5,39 @@ import { buildCodeBuddyToolBridge } from "../../src/adapters/codebuddy/tool-brid
 import { MemoryJournal, assistant, call, harness, result, toolAssistant, turn, until, user, withMessages } from "../fixtures/claude-session-worker";
 
 describe("Claude persistent session manager (offline adversarial)", () => {
+  test.each(["assistant", "result"] as const)("observes an accepted %s error once without losing usage or classification", async frame => {
+    for (const observerThrows of [false, true]) {
+      const h = harness();
+      const input = turn();
+      const observed: string[] = [];
+      const detail = "Rate limit exceeded · resets 3pm (Asia/Tokyo)";
+      input.onCliOutputError = message => {
+        observed.push(message);
+        if (observerThrows) throw new Error("injected usage observer failure");
+      };
+      const response = await h.start(input);
+      await response.worker.begin();
+      const terminal = { type: "result", subtype: "error_during_execution", is_error: true,
+        errors: [detail], usage: { input_tokens: 100, output_tokens: 7 } };
+      const failure = frame === "assistant" ? { type: "assistant", error: "rate_limit", message: {
+        role: "assistant", content: [{ type: "text", text: detail }], usage: { input_tokens: 100, output_tokens: 7 },
+      } } : terminal;
+      await response.worker.emit({ ...failure, user_message_uuid: crypto.randomUUID() });
+      expect(observed).toEqual([]);
+      await response.worker.emit(failure);
+      await response.done;
+      expect(observed).toEqual([detail]);
+      expect(response.events).toEqual([{ type: "error", message: detail, status: 429,
+        code: "rate_limit_exceeded", retryable: true, errorType: "rate_limit_error",
+        usage: { inputTokens: 100, outputTokens: 7, totalTokens: 107 } }]);
+      await response.worker.emit(terminal);
+      expect(observed).toEqual([detail]);
+      expect(response.events).toHaveLength(1);
+      expect(response.worker.stops).toBe(1);
+      await h.manager.close();
+    }
+  });
+
   test("reuses one native worker through identical parallel calls, results, final text and another user", async () => {
     const h = harness();
     const input = turn();
@@ -20,7 +53,8 @@ describe("Claude persistent session manager (offline adversarial)", () => {
     expect(first.events.filter(event => event.type === "tool_call_start")).toEqual(calls.map(call => ({
       type: "tool_call_start", id: call.id, name: "read_file",
     })));
-    expect(first.events.filter(event => event.type === "tool_call_delta")).toHaveLength(4);
+    expect(first.events.filter(event => event.type === "tool_call_delta").map(event => event.arguments).join(""))
+      .toBe(calls.map(call => JSON.stringify(call.arguments)).join(""));
     expect(first.events.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use", endTurn: false });
     const history = [...input.parsed.context.messages, toolAssistant(calls), result(calls[1]!.id, "right"), result(calls[0]!.id, "left")];
     const continued = h.run(withMessages(input, history));
@@ -227,7 +261,7 @@ describe("Claude persistent session manager (offline adversarial)", () => {
     const response = await h.start(input);
     await response.worker.finish("cached answer");
     await response.done;
-    h.manager.close();
+    await h.manager.close();
     const reopened = harness(journal);
     const replay = reopened.run(input);
     await replay.done;
@@ -253,7 +287,7 @@ describe("Claude persistent session manager (offline adversarial)", () => {
     await expect(replay.done).rejects.toMatchObject({ code: "claude_tool_delivery_uncertain" });
     expect(replay.events).toEqual([]);
     expect(worker.sends).toHaveLength(1);
-    h.manager.close();
+    await h.manager.close();
     const reopened = harness(h.journal);
     const durableRefusal = reopened.run(input);
     await expect(durableRefusal.done).rejects.toMatchObject({ code: "claude_tool_delivery_uncertain" });
@@ -295,7 +329,7 @@ describe("Claude persistent session manager (offline adversarial)", () => {
     const delivery = h.run(input, event => { if (event.type === "tool_call_start") throw new Error("consumer disconnected"); });
     await expect(delivery.done).rejects.toThrow("consumer disconnected");
     expect(h.journal.load(input.scope)!.turns[0]!.deliveryStarted).toBe(true);
-    h.manager.close();
+    await h.manager.close();
     const reopened = harness(h.journal);
     const retry = reopened.run(input);
     await expect(retry.done).rejects.toMatchObject({ code: "claude_tool_delivery_uncertain" });
@@ -335,7 +369,7 @@ describe("Claude persistent session manager (offline adversarial)", () => {
     calls.forEach(call => response.worker.mcp(call));
     await response.worker.blocks(calls);
     await response.done;
-    h.manager.close();
+    await h.manager.close();
     const reopened = harness(journal);
     const history = [...input.parsed.context.messages, toolAssistant(calls), result("toolu_a", "ALPHA"), result("toolu_b", "BETA", true)];
     const recovered = await reopened.start(withMessages(input, history));
@@ -367,7 +401,7 @@ describe("Claude persistent session manager (offline adversarial)", () => {
     expect(replay.events.filter(event => event.type.startsWith("tool_call_"))).toEqual([]);
     expect(error).toMatchObject({ code: "claude_tool_delivery_uncertain" });
     expect(first.worker.sends).toHaveLength(1);
-    h.manager.close();
+    await h.manager.close();
     const reopened = harness(h.journal);
     const changedCatalog = { ...input, bridge: { ...input.bridge, tools: input.bridge.tools.map(tool => ({ ...tool, description: "changed" })) } };
     for (const changed of [
@@ -391,7 +425,7 @@ describe("Claude persistent session manager (offline adversarial)", () => {
     first.worker.mcp(oldCall);
     await first.worker.blocks([oldCall]);
     await first.done;
-    h.manager.close();
+    await h.manager.close();
     const reopened = harness(journal);
     const recovered = await reopened.start(withMessages(input, [...input.parsed.context.messages,
       toolAssistant([oldCall]), result(oldCall.id, "already executed")]));
