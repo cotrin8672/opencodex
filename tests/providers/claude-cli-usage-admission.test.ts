@@ -17,6 +17,8 @@ import {
 import { getAdapterDefinition } from "../../src/adapters/registry";
 import { getConfigDir } from "../../src/config/paths";
 import { handleResponses } from "../../src/server/responses";
+import { handleChatCompletions } from "../../src/server/chat-completions";
+import { addFinalRequestLog, type RequestLogContext, type RequestLogEntry } from "../../src/server/request-log";
 import type { AdapterEvent, OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../../src/types";
 import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { createTestTranslatorBudget } from "../helpers/translator-budget";
@@ -64,12 +66,44 @@ describe("Claude usage admission cache", () => {
     const status = await checkClaudeUsageAdmission("claude-sonnet-5-5", { now: () => now, identity, probe: async () => null, statePath });
     expect(status.state).toBe("exhausted");
     expect(status.resetAt).toBe(resetAt);
-    expect(status.message).toContain(`paused until ${formatClaudeReset(resetAt)},`);
+    expect(status.message).toContain(`This turn is stopped. Quota resets at ${formatClaudeReset(resetAt)}.`);
     expect(status.message).not.toContain("America/New_York");
     // ICU versions differ in spacing (a narrow no-break space before "PM") and in joining the date
     // and time with "at": compare the words.
     const utc = formatClaudeReset(Date.UTC(2026, 9, 8, 15, 30), "UTC").replace(/[\s,]+/g, " ").trim();
     expect(utc).toMatch(/^Oct 8 (at )?3:30 PM (UTC|GMT)$/);
+  });
+
+  test("an unknown full plan reset is not borrowed from another window, and reads stay cached for 60 seconds", async () => {
+    let now = Date.now();
+    let probes = 0;
+    const quota = { fiveHourPercent: 100, weeklyPercent: 100, weeklyResetAt: now + 3_600_000, updatedAt: now };
+    const deps = { now: () => now, identity, statePath: tempState(), probe: async () => { probes++; return quota; } };
+    const first = await checkClaudeUsageAdmission("claude-sonnet-5-5", deps);
+    expect(first.state).toBe("exhausted");
+    expect(first).not.toHaveProperty("resetAt");
+    expect(first.message).toContain("reset time is not available");
+    now += 59_999;
+    expect(await checkClaudeUsageAdmission("claude-sonnet-5-5", deps)).toEqual(first);
+    expect(probes).toBe(1);
+    now++;
+    expect((await checkClaudeUsageAdmission("claude-sonnet-5-5", deps)).state).toBe("exhausted");
+    expect(probes).toBe(2);
+  });
+
+  test("only the matching model family makes a mixed known and unknown exhaustion reset unavailable", async () => {
+    const now = Date.now();
+    const resetAt = now + 3_600_000;
+    const statePath = seed({ ...freshQuota, weeklyPercent: 100, weeklyResetAt: resetAt,
+      customWindows: [{ label: "Opus", scope: "model", percent: 100 }] }, now);
+    let probes = 0;
+    const deps = { now: () => now, identity, statePath, probe: async () => { probes++; return freshQuota; } };
+    expect(await checkClaudeUsageAdmission("claude-sonnet-5-5", deps)).toMatchObject({ state: "exhausted", resetAt });
+    const opus = await checkClaudeUsageAdmission("claude-opus-5-5", deps);
+    expect(opus.state).toBe("exhausted");
+    expect(opus).not.toHaveProperty("resetAt");
+    expect(await checkClaudeUsageAdmission("claude-haiku-5-5", deps)).toMatchObject({ state: "exhausted", resetAt });
+    expect(probes).toBe(0);
   });
 
   test("the cache lives under OPENCODEX_HOME and stores no token", async () => {
@@ -319,7 +353,7 @@ describe("claude-cli adapter admission", () => {
     const events: AdapterEvent[] = [];
     await adapter.runTurn!({ ...parsed, modelId: "claude-x resets 9pm (UTC)" },
       { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, event => events.push(event));
-    expect(events).toEqual([expect.objectContaining({ type: "error", status: 429, code: "claude_subscription_cooldown", message: "paused" })]);
+    expect(events).toEqual([expect.objectContaining({ type: "error", status: 429, errorType: "usage_limit_reached", code: "usage_limit_reached", retryable: false, message: "paused" })]);
     expect(spawned).toBe(0);
   });
 
@@ -383,7 +417,7 @@ describe("claude-cli adapter admission", () => {
     });
     const events: AdapterEvent[] = [];
     await adapter.runTurn!(parsed, { headers: new Headers(), translatorBudget: createTestTranslatorBudget() }, event => events.push(event));
-    expect(events).toEqual([expect.objectContaining({ type: "error", status: 429, code: "claude_subscription_cooldown", message: "paused" })]);
+    expect(events).toEqual([expect.objectContaining({ type: "error", status: 429, errorType: "usage_limit_reached", code: "usage_limit_reached", retryable: false, message: "paused" })]);
     expect(spawned).toBe(0);
   });
 
@@ -401,13 +435,16 @@ describe("claude-cli adapter admission", () => {
   });
 });
 
-test("an exhausted Claude subscription is refused before dispatch with 429 and Retry-After; no CLI is spawned", async () => {
+test.each(["responses", "chat/completions"].flatMap(path => [true, false].flatMap(stream =>
+  [true, false].map(resetKnown => ({ path, stream, resetKnown })),
+)))("exhausted Claude returns quota JSON before dispatch ($path, stream=$stream, resetKnown=$resetKnown)", async ({ path, stream, resetKnown }) => {
   const definition = getAdapterDefinition("claude-cli")! as any;
   const originalCreate = definition.create;
   const releaseSpend = acquireOwnedSpendHome();
   let spawned = 0;
-  const resetAt = Date.now() + 90_000;
-  setClaudeUsagePreflightForTests(async () => ({ state: "exhausted", checkedAt: Date.now(), resetAt, message: "Claude subscription limits are exhausted." }));
+  const resetAt = resetKnown ? Date.now() + 90_001 : undefined;
+  const message = resetAt !== undefined ? `This turn is stopped. Quota resets at ${formatClaudeReset(resetAt)}.` : "This turn is stopped; the reset time is not available.";
+  setClaudeUsagePreflightForTests(async () => ({ state: "exhausted", checkedAt: Date.now(), resetAt, message }));
   definition.create = (provider: any) => createClaudeCliAdapter(provider, {
     usageAdmission: async () => ({ state: "available", checkedAt: 0 }),
     usageRefusal: () => {},
@@ -417,17 +454,33 @@ test("an exhausted Claude subscription is refused before dispatch with 429 and R
   const config = { port: 0, defaultProvider: "claude-cli", providers: {
     "claude-cli": { adapter: "claude-cli", baseUrl: "https://api.anthropic.com", authMode: "key", selectedModels: ["claude-sonnet-5-5"] },
   } } as OcxConfig;
-  const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: req => handleResponses(req, config, { model: "", provider: "" }) });
+  const logCtx: RequestLogContext = { model: "", provider: "" };
+  const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: req => path === "responses"
+    ? handleResponses(req, config, logCtx) : handleChatCompletions(req, config, logCtx) });
   try {
-    const res = await fetch(`http://127.0.0.1:${server.port}/v1/responses`, { method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "claude-cli/claude-sonnet-5-5", stream: false, input: "hello" }) });
+    const res = await fetch(`http://127.0.0.1:${server.port}/v1/${path}`, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "claude-cli/claude-sonnet-5-5", stream,
+        ...(path === "responses" ? { input: "hello" } : { messages: [{ role: "user", content: "hello" }] }) }) });
     const body = await res.json() as any;
     expect(res.status).toBe(429);
-    expect(body.error.code).toBe("claude_subscription_cooldown");
-    const retryAfter = Number(res.headers.get("retry-after"));
-    expect(retryAfter).toBeGreaterThan(60);
-    expect(retryAfter).toBeLessThanOrEqual(90);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    expect(body.error).toEqual({ type: "usage_limit_reached", code: "usage_limit_reached",
+      message, ...(resetAt !== undefined ? { resets_at: Math.ceil(resetAt / 1000) } : {}) });
+    expect(body.error).not.toHaveProperty("plan_type");
+    if (resetAt !== undefined) {
+      const retryAfter = Number(res.headers.get("retry-after"));
+      expect(retryAfter).toBeGreaterThan(60);
+      expect(retryAfter).toBeLessThanOrEqual(91);
+    } else {
+      expect(body.error).not.toHaveProperty("resets_at");
+      expect(res.headers.get("retry-after")).toBeNull();
+    }
     expect(spawned).toBe(0);
+    expect(logCtx.errorCode).toBe("usage_limit_reached");
+    const rows: RequestLogEntry[] = [];
+    addFinalRequestLog(`claude-quota-${path}-${stream}`, Date.now(), logCtx, res.status, undefined, row => rows.push(row));
+    expect(rows[0]?.errorCode).toBe("usage_limit_reached");
+    expect(rows[0]?.attempts?.at(-1)).toMatchObject({ errorCode: "usage_limit_reached", status: 429, sendCount: 0 });
   } finally {
     await server.stop(true);
     definition.create = originalCreate;

@@ -18,6 +18,7 @@
   "claude-cli-session-events.test.ts": "providers",
   "claude-cli-session-compaction.test.ts": "providers",
   "claude-cli-notification-results.test.ts": "providers",
+  "claude-cli-usage-limit-wire.test.ts": "providers",
   "claude-cli-usage-observer.test.ts": "providers",
   "claude-cli-usage-observer-integration.test.ts": "providers",
   "claude-cli-session-native-sync.test.ts": "providers",

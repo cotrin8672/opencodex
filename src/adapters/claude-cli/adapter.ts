@@ -21,7 +21,7 @@ import {
   CODEBUDDY_TOOL_LIMITS,
 } from "../codebuddy/tool-bridge";
 import { CLAUDE_CLI_PROFILES, type ClaudeCliProfile } from "./profiles";
-import { checkClaudeUsageAdmission, containsClaudeResetClock, createClaudeUsageObserver, recordClaudeUsageRefusal, type ClaudeAdmission, type ClaudeUsageObserver } from "./usage-admission";
+import { checkClaudeUsageAdmission, containsClaudeResetClock, createClaudeUsageObserver, parseClaudeReset, recordClaudeUsageRefusal, type ClaudeAdmission, type ClaudeUsageObserver } from "./usage-admission";
 import { ClaudeSessionSetup } from "./session-setup";
 import { buildStableClaudeConversationInput, CLAUDE_REPLAY_SYSTEM_PROMPT, stableClaudeToolBridge } from "./stable-replay";
 
@@ -175,15 +175,23 @@ function hasImageInput(parsed: OcxParsedRequest): boolean {
 }
 
 /**
- * Turn the CLI's unauthenticated turn into the one action a subscription user can take.
+ * Preserve login guidance and mark confirmed subscription exhaustion as terminal.
  *
  * An unauthenticated `claude` does not fail the process: it emits an ordinary terminal `result`
  * frame with `is_error: true` and the text "Not logged in · Please run /login", which the shared
  * mapper reports as a generic 401. Nothing in that reaches for the CLI's own sign-in, so the
  * operator is left guessing whether the key, the provider row or the account is wrong.
  */
-export function withClaudeLoginHint(emit: (event: AdapterEvent) => void): (event: AdapterEvent) => void {
+export function withClaudeLoginHint(emit: (event: AdapterEvent) => void, modelId = ""): (event: AdapterEvent) => void {
   return event => {
+    if (event.type === "error" && event.status === 429 && !containsClaudeResetClock(modelId)) {
+      const resetAt = parseClaudeReset(event.message);
+      if (resetAt !== undefined) {
+        emit({ ...event, errorType: "usage_limit_reached", code: "usage_limit_reached", retryable: false,
+          usageLimitResetAt: resetAt });
+        return;
+      }
+    }
     if (event.type === "error" && event.status === 401 && /not logged in|please run \/login/i.test(event.message)) {
       emit({
         ...event,
@@ -221,7 +229,9 @@ export function createClaudeCliAdapter(provider: OcxProviderConfig, deps: Claude
     async runTurn(parsed, incoming, emit): Promise<void> {
       const admission = await (deps.usageAdmission ?? checkClaudeUsageAdmission)(parsed.modelId);
       if (admission.state === "exhausted") {
-        emit({ type: "error", message: admission.message ?? "Claude subscription usage is exhausted; launches are paused until the reset.", status: 429, errorType: "rate_limit_error", code: "claude_subscription_cooldown", retryable: false });
+        emit({ type: "error", message: admission.message ?? "Claude subscription usage is exhausted; this turn is stopped.", status: 429,
+          errorType: "usage_limit_reached", code: "usage_limit_reached", retryable: false,
+          ...(admission.resetAt !== undefined ? { usageLimitResetAt: admission.resetAt } : {}) });
         return;
       }
       if (hasImageInput(parsed)) {
@@ -275,7 +285,7 @@ export function createClaudeCliAdapter(provider: OcxProviderConfig, deps: Claude
         const systemPrompt = [buildSystemPrompt(parsed), CLAUDE_REPLAY_SYSTEM_PROMPT, TOOL_BRIDGE_SYSTEM_PROMPT,
           "Each MCP tool description identifies its external client tool name. Use that MCP tool for the corresponding client instruction."].filter(Boolean).join("\n\n");
         const deliver = withClaudeLoginHint(event => emit(event.type === "error"
-          ? { ...event, message: redactSecrets(event.message, undefined, provider.apiKey) } : event));
+          ? { ...event, message: redactSecrets(event.message, undefined, provider.apiKey) } : event), parsed.modelId);
         try {
           await (deps.sessionManager ?? getClaudeSessionManager()).run({ scope, parsed, incoming, provider, binary,
             env: buildChildEnv(profile as ClaudeCliProfile, ""), systemPrompt, bridge: nativeBridge,
@@ -354,7 +364,7 @@ export function createClaudeCliAdapter(provider: OcxProviderConfig, deps: Claude
           provider,
           parsed,
           incoming,
-          emit: withClaudeLoginHint(emit),
+          emit: withClaudeLoginHint(emit, parsed.modelId),
           onCliMessage: message => usageObserver?.observe(message),
           onCliOutputError: message => {
             // The model id is caller input that reaches the CLI verbatim, and the CLI may reflect it

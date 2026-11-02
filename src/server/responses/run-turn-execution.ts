@@ -33,7 +33,7 @@ import {
 import { OAuthAccountPausedError, OAuthTokenRefreshBusyError, publicOAuthAuthenticationErrorMessage, type OAuthAccessSnapshot } from "../../oauth/index";
 import { tryAlternateAfterTerminalRefresh } from "../../oauth/kiro-terminal-failover";
 import { resolveWireProtocolOverride } from "../adapter-resolve";
-import { formatErrorResponse, bridgeToResponsesSSE, buildResponseJSON } from "../../bridge";
+import { formatErrorResponse, formatUsageLimitReachedResponse, bridgeToResponsesSSE, buildResponseJSON } from "../../bridge";
 import { redactSecretString } from "../../lib/redact";
 import { adapterFailureFromEvent } from "../../bridge/internal";
 import { resolveClientRetryAfter } from "../../lib/retry-after";
@@ -190,15 +190,11 @@ export async function executeResponsesRunTurn(
     if (usage.state === "exhausted") {
       cancelResponseCompletion();
       releaseSearchProbeLease();
-      const refusal = new Response(JSON.stringify({ error: {
-        type: "rate_limit_error", code: "claude_subscription_cooldown", param: null,
-        message: usage.message ?? "Claude subscription usage is exhausted.",
-      } }), {
-        status: 429,
-        headers: { "Content-Type": "application/json",
-          ...(usage.resetAt ? { "Retry-After": String(Math.max(1, Math.ceil((usage.resetAt - Date.now()) / 1000))) } : {}),
-        },
-      });
+      logCtx.errorCode = "usage_limit_reached";
+      const refusal = formatUsageLimitReachedResponse(
+        usage.message ?? "Claude subscription usage is exhausted.", usage.resetAt ?? null,
+        usage.resetAt !== undefined ? Math.max(1, Math.ceil((usage.resetAt - Date.now()) / 1000)) : null,
+      );
       markResponseNonReplayable(refusal);
       return refusal;
     }
@@ -775,6 +771,13 @@ export async function executeResponsesRunTurn(
         message: undeclaredToolCallMessage(effectiveName),
       };
     };
+    const usageLimitResponse = (httpStatus: number, error: OcxErrorPayload): Response | undefined => {
+      if (httpStatus !== 429 || error.type !== "usage_limit_reached" || error.code !== "usage_limit_reached") return;
+      logCtx.errorCode = "usage_limit_reached";
+      const resetAt = error.resets_at !== undefined ? error.resets_at * 1000 : null;
+      return formatUsageLimitReachedResponse(redactSecretString(error.message), resetAt,
+        resetAt !== null ? Math.max(1, Math.ceil((resetAt - Date.now()) / 1000)) : null);
+    };
     const grokDevinPreflight = !options.comboAttempt && logCtx.surface === "grok" && inboundWire === "responses"
       && transportState.runTurnAdapter.name === "devin";
     const grokRateLimitResponse = (preflight: AdapterEventPreflight): Response | undefined => {
@@ -787,7 +790,7 @@ export async function executeResponsesRunTurn(
       queue.close();
       cleanupRunTurnAbort();
       releaseSearchProbeLease();
-      return formatErrorResponse(httpStatus, error.type, error.message, {
+      return usageLimitResponse(httpStatus, error) ?? formatErrorResponse(httpStatus, error.type, error.message, {
         code: error.code,
         retryAfter: resolveClientRetryAfter({ status: httpStatus, message: error.message }),
       });
@@ -839,7 +842,7 @@ export async function executeResponsesRunTurn(
             type: "error", status: 502, message: "Adapter ended before producing a response",
           });
           const storageRefusal = preflight.error?.code === SPEND_LEDGER_STORAGE_UNAVAILABLE_CODE;
-          const failure = formatErrorResponse(storageRefusal ? 503 : classified.httpStatus,
+          const failure = usageLimitResponse(classified.httpStatus, classified.error) ?? formatErrorResponse(storageRefusal ? 503 : classified.httpStatus,
             storageRefusal ? SPEND_LEDGER_STORAGE_UNAVAILABLE_CODE : classified.error.type,
             redactSecretString(classified.error.message), {
               code: classified.error.code, classified: true, upstreamCode: preflight.error?.code ?? null,
@@ -1049,7 +1052,7 @@ export async function executeResponsesRunTurn(
             ? firstMeaningful
             : { type: "error", status: 502, message: "Adapter ended before producing a response" }));
           const storageRefusal = firstMeaningful?.type === "error" && firstMeaningful.code === SPEND_LEDGER_STORAGE_UNAVAILABLE_CODE;
-          const failure = formatErrorResponse(storageRefusal ? 503 : classified.httpStatus,
+          const failure = usageLimitResponse(classified.httpStatus, classified.error) ?? formatErrorResponse(storageRefusal ? 503 : classified.httpStatus,
             storageRefusal ? SPEND_LEDGER_STORAGE_UNAVAILABLE_CODE : classified.error.type,
             redactSecretString(classified.error.message), {
               code: classified.error.code, classified: true,

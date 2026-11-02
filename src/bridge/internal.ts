@@ -156,6 +156,11 @@ export function adapterFailureFromEvent(event: Extract<AdapterEvent, { type: "er
   const error = classifyError(httpStatus, event.errorType ?? fallback.error.type, message);
   if (event.errorType !== undefined) error.type = event.errorType;
   if (event.code !== undefined) error.code = event.code;
+  if (httpStatus === 429 && error.type === "usage_limit_reached" && error.code === "usage_limit_reached"
+    && typeof event.usageLimitResetAt === "number" && event.usageLimitResetAt > 0
+    && Number.isFinite(new Date(event.usageLimitResetAt).getTime())) {
+    error.resets_at = Math.ceil(event.usageLimitResetAt / 1000);
+  }
   // Codex only parses a streamed retry delay for these canonical rate-limit codes.
   // Preserve other typed verdicts (quota, auth, local send budgets) verbatim.
   if (httpStatus === 429 && error.type === "rate_limit_error"

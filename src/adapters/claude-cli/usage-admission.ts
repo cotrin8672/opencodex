@@ -211,9 +211,12 @@ function admission(snapshot: Snapshot, model: string, now: number): ClaudeAdmiss
   if (finite(snapshot.refusalUntil) && snapshot.refusalUntil > now) exhausted.push({ percent: 100, resetAt: snapshot.refusalUntil });
   if (exhausted.length) {
     const resets = exhausted.map(w => w.resetAt).filter(finite);
-    // Unknown reset windows require another read after the short cache, not an invented reset date.
-    const resetAt = resets.length === exhausted.length ? Math.max(...resets) : Math.max(snapshot.checkedAt + CACHE_MS, ...resets);
-    return { state: "exhausted", checkedAt: snapshot.checkedAt, resetAt, message: `Claude subscription limits are exhausted. Claude launches are paused until ${formatClaudeReset(resetAt)}, then usage will be checked again.` };
+    // The short cache is a probe deadline, never a promised usage-window reset.
+    const resetAt = resets.length === exhausted.length ? Math.max(...resets) : undefined;
+    return { state: "exhausted", checkedAt: snapshot.checkedAt, ...(resetAt !== undefined ? { resetAt } : {}),
+      message: resetAt !== undefined
+        ? `Claude subscription limits are exhausted. This turn is stopped. Quota resets at ${formatClaudeReset(resetAt)}.`
+        : "Claude subscription limits are exhausted. This turn is stopped; the reset time is not available." };
   }
   return { state: quota ? "available" : "unknown", checkedAt: snapshot.checkedAt };
 }

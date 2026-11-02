@@ -280,7 +280,7 @@ export async function collectChatCompletionResponse(
     });
   } catch (err) {
     if (isChatCompletionsStreamError(err)) {
-      return chatCompletionsErrorResponse(err.status, err.message, err.type, err.code);
+      return chatCompletionsErrorResponse(err.status, err.message, err.type, err.code, err.resets_at);
     }
     return chatCompletionsErrorResponse(502, err instanceof Error ? err.message : String(err), "server_error");
   }

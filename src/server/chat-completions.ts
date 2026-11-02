@@ -6,6 +6,7 @@
  * that need Responses-only behavior keep the Chat -> Responses -> Chat bridge.
  */
 import { FORWARD_HEADERS } from "../adapters/openai-responses";
+import { formatUsageLimitReachedResponse } from "../bridge/errors";
 import {
   assertChatCompletionsRoutingBody,
   chatRawReasoningVisible,
@@ -35,6 +36,7 @@ import {
   applyReplayRefusalClientHeaders,
   isReplayRefusalCode,
   isReplayRefusalResponse,
+  markResponseNonReplayable,
   REPLAY_REFUSAL_CLIENT_HEADERS,
   REPLAY_REFUSED_STATUS,
   retainReplayRefusal,
@@ -148,7 +150,7 @@ export async function handleChatCompletions(
     }
     if (isChatCompletionsStreamError(error)) {
       if (logIds) addFinalRequestLog(logIds.requestId, logIds.start, logCtx, error.status, { closeReason: "non_stream" });
-      return chatCompletionsErrorResponse(error.status, error.message, error.type, error.code);
+      return chatCompletionsErrorResponse(error.status, error.message, error.type, error.code, error.resets_at);
     }
     throw error;
   }
@@ -627,11 +629,12 @@ async function handleChatCompletionsWithBudget(
     let message = `upstream error (${upstream.status})`;
     let upstreamCode: string | null | undefined;
     let upstreamType: string | undefined;
+    let upstreamResetAt: number | null = null;
     try {
       const text = await upstream.text();
       try {
         const parsed = JSON.parse(text) as {
-          error?: { message?: string; type?: string; code?: string | null } | string;
+          error?: { message?: string; type?: string; code?: string | null; resets_at?: number } | string;
           message?: string;
           type?: string;
           code?: string | null;
@@ -649,10 +652,18 @@ async function handleChatCompletionsWithBudget(
         const structuredCode = nested?.code ?? parsed.code;
         if (typeof structuredType === "string") upstreamType = structuredType;
         if (structuredCode === null || typeof structuredCode === "string") upstreamCode = structuredCode;
+        if (typeof nested?.resets_at === "number" && nested.resets_at > 0
+          && Number.isFinite(new Date(nested.resets_at * 1000).getTime())) upstreamResetAt = nested.resets_at * 1000;
       } catch {
         if (text) message = `upstream error (${upstream.status}): ${redactSecretString(text).slice(0, 400)}`;
       }
     } catch { /* keep fallback */ }
+    if (upstream.status === 429 && upstreamType === "usage_limit_reached" && upstreamCode === "usage_limit_reached") {
+      const stopped = formatUsageLimitReachedResponse(message, upstreamResetAt,
+        upstreamResetAt !== null ? Math.max(1, Math.ceil((upstreamResetAt - Date.now()) / 1000)) : null);
+      markResponseNonReplayable(stopped);
+      return logIds ? responseWithDeferredRequestLog(stopped, logIds.requestId, logIds.start, logCtx) : stopped;
+    }
     const classified = classifyError(
       upstream.status,
       upstreamType
@@ -751,7 +762,7 @@ async function handleChatCompletionsWithBudget(
       });
     } catch (err) {
       if (isChatCompletionsStreamError(err)) {
-        return chatCompletionsErrorResponse(err.status, err.message, err.type, err.code);
+        return chatCompletionsErrorResponse(err.status, err.message, err.type, err.code, err.resets_at);
       }
       return chatCompletionsErrorResponse(
         502,
@@ -774,8 +785,11 @@ async function handleChatCompletionsWithBudget(
   }
   const status = (json as Rec)?.status;
   if (status === "failed") {
-    const error = (json as { error?: { message?: string; type?: string; code?: string | null } }).error;
+    const error = (json as { error?: { message?: string; type?: string; code?: string | null; resets_at?: number } }).error;
     const message = redactSecretString(error?.message ?? "upstream request failed");
+    if (error?.type === "usage_limit_reached" && error.code === "usage_limit_reached") {
+      return finishJson(chatCompletionsErrorResponse(429, message, error.type, error.code, error.resets_at));
+    }
     const classified = classifyError(502, error?.type ?? "server_error", message);
     if (error?.code === "translation_buffer_limit") {
       classified.code = "translation_buffer_limit";

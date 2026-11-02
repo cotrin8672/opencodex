@@ -8,6 +8,7 @@
 type Rec = Record<string, unknown>;
 
 import { decodeServerSentEvents } from "../lib/sse-decoder";
+import { adapterFailureFromEvent } from "../bridge/internal";
 import {
   isTranslatorBudgetExceededError,
   type TranslatorBudget,
@@ -66,7 +67,13 @@ export function chatCompletionsErrorBody(
   message: string,
   type?: string,
   code?: string | null,
+  resetsAt?: number,
 ): Rec {
+  if (status === 429 && type === "usage_limit_reached" && code === "usage_limit_reached") {
+    const { error } = adapterFailureFromEvent({ type: "error", status, message, errorType: type, code,
+      usageLimitResetAt: typeof resetsAt === "number" ? resetsAt * 1000 : undefined });
+    return { error: { ...error, param: null, retryable: false } };
+  }
   if (isCyberPolicyCode(code) || isCyberPolicyMessage(message)) {
     return {
       error: {
@@ -97,13 +104,19 @@ export function chatCompletionsErrorResponse(
   message: string,
   type?: string,
   code?: string | null,
+  resetsAt?: number,
 ): Response {
-  const body = chatCompletionsErrorBody(status, message, type, code);
-  const err = body.error as { code?: string | null };
+  const body = chatCompletionsErrorBody(status, message, type, code, resetsAt);
+  const err = body.error as { type?: string; code?: string | null; resets_at?: number };
   const finalStatus = err.code === CYBER_POLICY_ERROR_CODE ? 400 : status;
+  const headers = new Headers({ "Content-Type": "application/json" });
+  if (finalStatus === 429 && err.type === "usage_limit_reached" && err.code === "usage_limit_reached"
+    && err.resets_at !== undefined) {
+    headers.set("Retry-After", String(Math.max(1, Math.ceil(err.resets_at - Date.now() / 1000))));
+  }
   return new Response(JSON.stringify(body), {
     status: finalStatus,
-    headers: { "Content-Type": "application/json" },
+    headers,
   });
 }
 
@@ -112,13 +125,20 @@ export class ChatCompletionsStreamError extends Error {
   readonly status: number;
   readonly type: string;
   readonly code: string | null;
+  readonly resets_at?: number;
+  readonly retryable?: false;
 
-  constructor(message: string, options: { status?: number; type?: string; code?: string | null } = {}) {
+  constructor(message: string, options: ChatCompletionsStreamFailure = {}) {
     super(message);
     this.name = "ChatCompletionsStreamError";
     this.status = options.status ?? 502;
     this.type = options.type ?? "server_error";
     this.code = options.code ?? null;
+    if (this.status === 429 && this.type === "usage_limit_reached" && this.code === "usage_limit_reached") {
+      const body = chatCompletionsErrorBody(this.status, message, this.type, this.code, options.resets_at);
+      this.resets_at = (body.error as { resets_at?: number }).resets_at;
+      this.retryable = false;
+    }
   }
 }
 
@@ -172,6 +192,7 @@ export interface ChatCompletionsStreamFailure {
   code?: string | null;
   type?: string;
   status?: number;
+  resets_at?: number;
 }
 
 /**
@@ -187,6 +208,10 @@ export function chatCompletionsStreamErrorPayload(
   const safeMessage = translatorOverflow ? "upstream translation buffer exceeded the safe limit"
     : details?.code === "invalid_refusal" ? "upstream refusal representations are inconsistent"
     : redactSecretString(message);
+  if (details?.type === "usage_limit_reached" && details.code === "usage_limit_reached"
+    && (details.status === undefined || details.status === 429)) {
+    return { payload: chatCompletionsErrorBody(429, safeMessage, details.type, details.code, details.resets_at), bounded: false };
+  }
   const statusHint = details?.status ?? streamErrorStatus(safeMessage);
   const classified = classifyError(statusHint, details?.type ?? "upstream_error", safeMessage);
   if (translatorOverflow) {
@@ -233,6 +258,8 @@ export function chatCompletionsFailedResponse(error: Rec): { message: string; de
     message,
     details: {
       code,
+      ...(type === "usage_limit_reached" && code === "usage_limit_reached"
+        ? { status: 429, ...(typeof error.resets_at === "number" ? { resets_at: error.resets_at } : {}) } : {}),
       ...(code === "translation_buffer_limit"
         ? { status: 502, type: "upstream_error" }
         // A terminal refusal code is a 400-class verdict; inferring status from its wording
@@ -843,7 +870,7 @@ export function responsesSseToChatCompletionsSse(
             closeToolCalls();
             fail(err.message, { status: 502, type: "upstream_error", code: err.code });
           } else if (isChatCompletionsStreamError(err)) {
-            fail(err.message, { status: err.status, type: err.type, code: err.code });
+            fail(err.message, err);
           } else {
             fail(err instanceof Error ? err.message : String(err));
           }
@@ -1064,7 +1091,7 @@ export async function collectChatCompletion(
             : "upstream request failed";
           const type = typeof parsed.error.type === "string" ? parsed.error.type : "server_error";
           const code = typeof parsed.error.code === "string" ? parsed.error.code : null;
-          const status = code === "translation_buffer_limit"
+          const status = type === "usage_limit_reached" && code === "usage_limit_reached" ? 429 : code === "translation_buffer_limit"
             ? 502
             : isTerminalRefusalCode(code) || isCyberPolicyMessage(message)
               ? 400
@@ -1073,6 +1100,7 @@ export async function collectChatCompletion(
             status,
             type: code === "translation_buffer_limit" ? "upstream_error" : type,
             code,
+            ...(typeof parsed.error.resets_at === "number" ? { resets_at: parsed.error.resets_at } : {}),
           });
           throw streamError;
         }

@@ -525,6 +525,8 @@ export type AdapterEvent =
       status?: number;
       /** Responses error type and code when the adapter has a structured provider failure. */
       errorType?: string;
+      /** Confirmed usage-window reset, in epoch milliseconds. */
+      usageLimitResetAt?: number;
       code?: string;
       /** Proxy-internal permission to consider API-key recovery; never serialized. */
       apiKeyRecovery?: true;

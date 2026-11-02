@@ -1594,8 +1594,10 @@ CLI headlessly, retaining a native conversation for clients that supply their ow
   and native session references. Claude Code also persists the conversation transcript in its selected profile.
 - **Subscription limits:** before each request OpenCodex asks Anthropic's usage endpoint, with the
   CLI's own sign-in read in memory, whether the plan's 5-hour, weekly or model-specific window is
-  full. An exhausted plan is refused locally with HTTP 429 `claude_subscription_cooldown` and a
-  `Retry-After` for the reset, instead of starting a CLI that would fail. The answer is cached for
+  full. An exhausted plan is refused locally with HTTP 429 `usage_limit_reached`, allowing Codex
+  to stop automatic retries. A known reset is returned in `resets_at` and `Retry-After`; an unknown
+  reset is omitted. A confirmed CLI refusal during generation uses the same terminal quota error.
+  Transient throttles keep their ordinary retry behavior. The answer is cached for
   a minute in `claude-usage-admission.json` under the OpenCodex home (percentages, reset times and
   a hashed account key only). CLI quota notifications update the fields they actually contain,
   including notifications received after an HTTP tool handoff. Model completion also schedules

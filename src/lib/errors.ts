@@ -4,6 +4,7 @@ export interface OcxErrorPayload {
   message: string;
   type: string;
   code: string | null;
+  resets_at?: number;
 }
 
 export const ENCRYPTED_FUNCTION_OUTPUT_REJECTION =
