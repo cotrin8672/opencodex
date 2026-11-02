@@ -3,10 +3,12 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { getConfigDir } from "../../config/paths";
+import { trackBackgroundWork } from "../../lib/background-work";
 import { isTestHomeGuardArmed } from "../../lib/test-home-guard";
 import { detectClaudeCodeTokenAsync } from "../../oauth/local-token-detect";
 import { readAnthropicUsageQuota } from "../../providers/claude-cli-usage";
 import type { ProviderQuota } from "../../providers/quota-types";
+import { createUsageActivity, record, usageEventWindows, type UsageWindow } from "./usage-events";
 
 export type ClaudeAdmission = {
   state: "available" | "exhausted" | "unknown";
@@ -14,7 +16,7 @@ export type ClaudeAdmission = {
   resetAt?: number;
   message?: string;
 };
-type Snapshot = { identity: string; checkedAt: number; quota?: ProviderQuota; refusalUntil?: number };
+type Snapshot = { identity: string; checkedAt: number; quota?: ProviderQuota; refusalUntil?: number; fieldFreshness?: Record<string, number> };
 type Identity = { key: string; access: string };
 export type AdmissionDeps = {
   now?: () => number;
@@ -24,8 +26,12 @@ export type AdmissionDeps = {
   statePath?: string;
 };
 const CACHE_MS = 60_000;
-const inflight = new Map<string, Promise<Snapshot | null>>();
+type UsageProbe = { started: number; work: Promise<Snapshot | null> };
+const inflight = new Map<string, UsageProbe>();
 const memory = new Map<string, Snapshot>();
+// Ordering also distinguishes a notification and GET started in the same millisecond.
+let sequence = 0;
+const fieldVersions = new Map<string, Map<string, number>>();
 let identityCache: { scope: string; at: number; value: Promise<Identity | null> } | undefined;
 
 const nonEmpty = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
@@ -70,6 +76,7 @@ function load(path: string): Snapshot | undefined {
     const saved = JSON.parse(readFileSync(path, "utf8"));
     if (typeof saved.identity !== "string" || !Number.isFinite(saved.checkedAt)) return;
     if (saved.refusalUntil !== undefined && !finite(saved.refusalUntil)) return;
+    if (saved.fieldFreshness !== undefined && (!record(saved.fieldFreshness) || !Object.values(saved.fieldFreshness).every(finite))) return;
     if (saved.quota !== undefined) {
       const q = saved.quota;
       if (!q || typeof q !== "object" || !finite(q.updatedAt)) return;
@@ -95,6 +102,88 @@ function save(path: string, snapshot: Snapshot): void {
   } catch { /* Memory still suppresses launches; no secrets or upstream text are persisted. */ }
 }
 function finite(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value); }
+
+function latest(path: string, identity?: string): Snapshot | undefined {
+  return [memory.get(path), load(path)].filter((s): s is Snapshot => s !== undefined && (identity === undefined || s.identity === identity))
+    .sort((a, b) => b.checkedAt - a.checkedAt || (b.quota?.updatedAt ?? 0) - (a.quota?.updatedAt ?? 0) || (b.refusalUntil ?? 0) - (a.refusalUntil ?? 0))[0];
+}
+function quotaWindows(quota?: ProviderQuota): UsageWindow[] {
+  if (!quota) return [];
+  return [
+    { key: "five_hour", percent: quota.fiveHourPercent, resetAt: quota.fiveHourResetAt },
+    { key: "seven_day", percent: quota.weeklyPercent, resetAt: quota.weeklyResetAt },
+    ...(quota.customWindows ?? []).map(w => ({ ...w, key: `seven_day_${w.label.toLowerCase()}` })),
+  ].filter(w => w.percent !== undefined || w.resetAt !== undefined);
+}
+function mergeWindows(path: string, identity: string, old: Snapshot | undefined, incoming: UsageWindow[], at: number, order: number, replace = false): Pick<Snapshot, "quota" | "fieldFreshness"> {
+  const windows = new Map(quotaWindows(old?.quota).map(w => [w.key, { ...w }]));
+  const freshness = { ...old?.fieldFreshness };
+  const requestKey = `${path}:${identity}`;
+  const versions = fieldVersions.get(requestKey) ?? new Map<string, number>();
+  fieldVersions.set(requestKey, versions);
+  for (const window of windows.values()) for (const field of ["percent", "resetAt"] as const) {
+    if (window[field] !== undefined) freshness[`${window.key}.${field}`] ??= old!.quota!.updatedAt;
+    const key = `${window.key}.${field}`;
+    if (replace && (versions.get(key) ?? 0) <= order) {
+      delete window[field]; delete freshness[key]; versions.set(key, order);
+    }
+  }
+  if (replace) versions.set("$full", order);
+  for (const patch of incoming) {
+    const window = windows.get(patch.key) ?? { key: patch.key, ...(patch.label ? { label: patch.label, scope: patch.scope } : {}) };
+    // A new reset without utilization describes a different window, not the old counter.
+    if (!replace && patch.percent === undefined && patch.resetAt !== undefined && patch.resetAt !== window.resetAt
+      && (versions.get(`${patch.key}.resetAt`) ?? versions.get("$full") ?? 0) <= order
+      && (versions.get(`${patch.key}.percent`) ?? versions.get("$full") ?? 0) <= order) {
+      delete window.percent; delete freshness[`${patch.key}.percent`]; versions.set(`${patch.key}.percent`, order);
+    }
+    for (const field of ["percent", "resetAt"] as const) {
+      const key = `${patch.key}.${field}`;
+      if (patch[field] === undefined || (versions.get(key) ?? versions.get("$full") ?? 0) > order) continue;
+      window[field] = patch[field];
+      freshness[key] = at;
+      versions.set(key, order);
+    }
+    windows.set(patch.key, window);
+  }
+  if (!old?.quota && ![...windows.values()].some(w => w.percent !== undefined)) return {};
+  const five = windows.get("five_hour"); const week = windows.get("seven_day");
+  const customWindows = [...windows.values()].filter((w): w is UsageWindow & { label: string; percent: number } => w.label !== undefined && w.percent !== undefined)
+    .map(({ label, percent, resetAt, scope }) => ({ label, percent, ...(resetAt !== undefined ? { resetAt } : {}), ...(scope ? { scope } : {}) }));
+  // A partial notification cannot make an unobserved counter (or reset) look new.
+  const observed = [...windows.values()].flatMap(w => (["percent", "resetAt"] as const).filter(field => w[field] !== undefined).map(field => freshness[`${w.key}.${field}`]!));
+  return { quota: {
+    ...(five?.percent !== undefined ? { fiveHourPercent: five.percent } : {}), ...(five?.resetAt !== undefined ? { fiveHourResetAt: five.resetAt } : {}),
+    ...(week?.percent !== undefined ? { weeklyPercent: week.percent } : {}), ...(week?.resetAt !== undefined ? { weeklyResetAt: week.resetAt } : {}),
+    ...(customWindows.length ? { customWindows } : {}), updatedAt: observed.length ? Math.min(...observed) : at,
+  }, fieldFreshness: freshness };
+}
+
+function startProbe(identity: Identity, path: string, deps: AdmissionDeps): UsageProbe {
+  const requestKey = `${path}:${identity.key}`;
+  const existing = inflight.get(requestKey);
+  if (existing) return existing;
+  const started = ++sequence;
+  const work = (async () => {
+    const current = await resolveIdentity(deps, true);
+    if (!current || current.key !== identity.key) return null;
+    let quota: ProviderQuota | null = null;
+    try { quota = await (deps.probe ?? readAnthropicUsageQuota)(current.access); } catch { /* Keep the last good measurement on transport failure. */ }
+    if ((await resolveIdentity(deps, true))?.key !== identity.key) return null;
+    const at = (deps.now ?? Date.now)();
+    // Nothing awaits between the latest read, merge and write: notifications and refusals win races.
+    const old = latest(path, identity.key);
+    const snapshot: Snapshot = {
+      ...old, identity: identity.key, checkedAt: quota || !old?.quota ? at : old.checkedAt,
+      ...(quota ? mergeWindows(path, identity.key, old, quotaWindows(quota), at, started, true) : {}),
+    };
+    save(path, snapshot);
+    return snapshot;
+  })().finally(() => { if (inflight.get(requestKey)?.work === work) inflight.delete(requestKey); });
+  const probe = { started, work };
+  inflight.set(requestKey, probe);
+  return probe;
+}
 /** Windows that gate this model: the plan windows plus custom windows in scope for its family. */
 function applicableWindows(quota: ProviderQuota | undefined, model: string): { percent?: number; resetAt?: number }[] {
   const family = /opus|sonnet|fable|haiku/i.exec(model)?.[0]?.toLowerCase();
@@ -141,9 +230,7 @@ async function checkAdmission(model: string, deps: AdmissionDeps, now: number): 
   const identity = await resolveIdentity(deps);
   if (!identity) return { state: "unknown", checkedAt: now };
   const path = statePath(deps);
-  const disk = load(path);
-  const local = memory.get(path);
-  const cached = [disk, local].filter((s): s is Snapshot => s?.identity === identity.key).sort((a, b) => b.checkedAt - a.checkedAt || (b.refusalUntil ?? 0) - (a.refusalUntil ?? 0))[0];
+  const cached = latest(path, identity.key);
   if (cached) {
     const status = admission(cached, model, now);
     if (status.state === "exhausted" && status.resetAt! > now) return status;
@@ -152,30 +239,7 @@ async function checkAdmission(model: string, deps: AdmissionDeps, now: number): 
       .some(reset => finite(reset) && reset <= now);
     if (!expiredReset && now >= cached.checkedAt && now - cached.checkedAt < CACHE_MS) return status;
   }
-  const requestKey = `${path}:${identity.key}`;
-  let probe = inflight.get(requestKey);
-  if (!probe) {
-    probe = (async () => {
-      let quota: ProviderQuota | null = null;
-      try { quota = await (deps.probe ?? readAnthropicUsageQuota)(identity.access); } catch { /* Unavailable is unknown. */ }
-      // A login change during the probe makes this answer belong to no current account: neither
-      // persist it nor admit or refuse with it.
-      if ((await resolveIdentity(deps, true))?.key !== identity.key) return null;
-      // Merge the newest refusal at commit time. Nothing awaits between this read and the write,
-      // so a refusal the CLI reported while the probe was in flight is never overwritten.
-      const at = (deps.now ?? Date.now)();
-      const refusals = [load(path), memory.get(path)]
-        .filter((s): s is Snapshot => s?.identity === identity.key)
-        .map(s => s.refusalUntil)
-        .filter((until): until is number => finite(until) && until > at);
-      const refusalUntil = refusals.length ? Math.max(...refusals) : undefined;
-      const snapshot: Snapshot = { identity: identity.key, checkedAt: at, ...(quota ? { quota } : {}), ...(refusalUntil ? { refusalUntil } : {}) };
-      save(path, snapshot);
-      return snapshot;
-    })().finally(() => inflight.delete(requestKey));
-    inflight.set(requestKey, probe);
-  }
-  const snapshot = await probe;
+  const snapshot = await startProbe(identity, path, deps).work;
   if (!snapshot) return { state: "unknown", checkedAt: (deps.now ?? Date.now)() };
   return admission(snapshot, model, (deps.now ?? Date.now)());
 }
@@ -191,9 +255,7 @@ export type ClaudeUsageObservation = Readonly<Snapshot>;
  * own SHA-256 account key, never the account uuid itself.
  */
 export function peekClaudeUsageObservation(deps: Pick<AdmissionDeps, "statePath"> = {}): ClaudeUsageObservation | null {
-  const path = statePath(deps);
-  const rows = [load(path), memory.get(path)].filter((s): s is Snapshot => s !== undefined);
-  return rows.sort((a, b) => b.checkedAt - a.checkedAt)[0] ?? null;
+  return latest(statePath(deps)) ?? null;
 }
 /** Test seam for the pre-dispatch check in the Responses executor; call with no argument to restore. */
 export function setClaudeUsagePreflightForTests(fn?: (model: string) => Promise<ClaudeAdmission>): void { preflightOverride = fn; }
@@ -250,7 +312,86 @@ export async function recordClaudeUsageRefusal(message: string, deps: AdmissionD
   const identity = await resolveIdentity(deps);
   if (!identity) return;
   const path = statePath(deps);
-  const old = load(path);
-  const same = old?.identity === identity.key ? old : undefined;
-  save(path, { identity: identity.key, checkedAt: now, ...(same?.quota ? { quota: same.quota } : {}), refusalUntil: Math.max(until, same?.refusalUntil ?? 0) });
+  const same = latest(path, identity.key);
+  save(path, { ...same, identity: identity.key, checkedAt: same?.checkedAt ?? 0, refusalUntil: Math.max(until, same?.refusalUntil ?? 0) });
+}
+
+export interface ClaudeUsageObserver {
+  ready?: Promise<void>;
+  observe(message: unknown): void;
+  finish(): void;
+}
+type ObserverDeps = AdmissionDeps & { minRefreshMs?: number };
+type CompletionRefresh = { requested: number; served: number; lastStarted?: number; work?: Promise<void> };
+const completionRefreshes = new Map<string, CompletionRefresh>();
+
+function refreshAfterCompletion(identityKey: string, path: string, deps: ObserverDeps, completion: number): void {
+  const key = `${path}:${identityKey}`;
+  const refresh = completionRefreshes.get(key) ?? { requested: 0, served: 0 };
+  completionRefreshes.set(key, refresh);
+  refresh.requested = Math.max(refresh.requested, completion);
+  if (refresh.work) return;
+  const minRefreshMs = finite(deps.minRefreshMs) && deps.minRefreshMs >= 0 ? deps.minRefreshMs : 5_000;
+  const work = Promise.resolve().then(async () => {
+    while (refresh.served < refresh.requested) {
+      const prior = inflight.get(key);
+      if (prior) {
+        await prior.work;
+        refresh.served = Math.max(refresh.served, prior.started);
+        if (refresh.served >= refresh.requested) break;
+      }
+      const delay = Math.max(0, (refresh.lastStarted ?? -Infinity) + minRefreshMs - (deps.now ?? Date.now)());
+      if (delay > 0) await new Promise<void>(resolve => { const timer = setTimeout(resolve, delay); timer.unref?.(); });
+      // Never spend a former worker's credential after the operator switches accounts.
+      const current = await resolveIdentity(deps, true);
+      if (!current || current.key !== identityKey) { refresh.served = refresh.requested; break; }
+      const probe = startProbe(current, path, deps);
+      refresh.lastStarted = (deps.now ?? Date.now)();
+      await probe.work;
+      refresh.served = Math.max(refresh.served, probe.started);
+    }
+  }).catch(() => { refresh.served = refresh.requested; }).finally(() => {
+    refresh.work = undefined;
+    if (refresh.served < refresh.requested) refreshAfterCompletion(identityKey, path, deps, refresh.requested);
+  });
+  refresh.work = work;
+  void trackBackgroundWork("claude-usage-completion", work);
+}
+
+/** Bind once to the worker's account; telemetry never blocks or throws into its stream. */
+export function createClaudeUsageObserver(deps: ObserverDeps = {}): ClaudeUsageObserver {
+  const identity = trackBackgroundWork("claude-usage-identity", resolveIdentity(deps, true).then(value => value?.key ?? null));
+  const schedule = (work: (identityKey: string, path: string) => void | Promise<void>) => {
+    void trackBackgroundWork("claude-usage-observation", identity.then(async captured => {
+      if (!captured) return;
+      const path = statePath(deps);
+      if ((await resolveIdentity(deps, true))?.key !== captured) return;
+      await work(captured, path);
+    }).catch(() => {}));
+  };
+  const activity = createUsageActivity(() => {
+    const completion = ++sequence;
+    schedule((captured, path) => refreshAfterCompletion(captured, path, deps, completion));
+  });
+  return {
+    ready: identity.then(() => undefined),
+    observe(message) {
+      try {
+        const raw = record(message);
+        if (!raw || raw.isReplay === true || raw.is_replay === true) return;
+        const windows = usageEventWindows(raw);
+        if (windows.length) {
+          const order = ++sequence;
+          const at = (deps.now ?? Date.now)();
+          schedule((captured, path) => {
+            const old = latest(path, captured);
+            const merged = mergeWindows(path, captured, old, windows, at, order);
+            if (merged.quota) save(path, { ...old, identity: captured, checkedAt: old?.checkedAt ?? 0, ...merged });
+          });
+        }
+        activity.observe(raw);
+      } catch { /* Malformed optional telemetry cannot break generation. */ }
+    },
+    finish() { try { activity.finish(); } catch { /* Best-effort worker-stop fallback. */ } },
+  };
 }

@@ -12,6 +12,7 @@ export interface ClaudeSdkStreamState extends StreamParseState {
   sdkResponseId?: string;
   sdkContentBlocks?: Map<number, { kind: ContentKind; streamed: boolean; claimed: boolean }>;
   sdkResponseUsage?: Map<string, OcxUsage>;
+  sdkReportedUsage?: OcxUsage;
 }
 
 export function createClaudeSdkStreamState(options: Pick<StreamParseState,
@@ -51,6 +52,20 @@ function foldUsage(a: OcxUsage, b: OcxUsage, combine: (a: number, b: number) => 
 }
 
 const ZERO_USAGE: OcxUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+
+export function sumClaudeSdkUsage(previous: OcxUsage | undefined, next: OcxUsage | undefined): OcxUsage | undefined {
+  return previous && next ? foldUsage(previous, next, (a, b) => a + b) : next ?? previous;
+}
+
+/** Results span the native turn; earlier HTTP tool handoffs have already reported their share. */
+export function claudeSdkResultUsage(message: Pick<Extract<SDKMessage, { type: "result" }>, "usage">, state: ClaudeSdkStreamState): OcxUsage {
+  const aggregate = message.usage && typeof message.usage === "object" ? usageFromResult({ usage: message.usage }) ?? ZERO_USAGE : undefined;
+  const remainder = aggregate ? foldUsage(aggregate, state.sdkReportedUsage ?? ZERO_USAGE, (a, b) => Math.max(0, a - b)) : undefined;
+  const usage = (state.sawMessageStop ? state.partialUsage : undefined) ?? remainder ?? state.partialUsage ?? { ...ZERO_USAGE };
+  state.partialUsage = usage;
+  state.sawTerminalResult = true;
+  return usage;
+}
 
 function observeUsage(state: ClaudeSdkStreamState, usage: object): void {
   const next = usageFromResult({ usage });
@@ -255,9 +270,7 @@ export function mapClaudeSdkMessage(message: SDKMessage, state: ClaudeSdkStreamS
     return events;
   }
   if (message.type === "result") {
-    const usage = usageFromResult({ usage: message.usage }) ?? { ...ZERO_USAGE };
-    state.partialUsage = usage;
-    state.sawTerminalResult = true;
+    const usage = claudeSdkResultUsage(message, state);
     if (message.subtype !== "success" || message.is_error) {
       const detail = message.subtype === "success" ? message.result : message.errors.find(error => error.trim());
       const text = detail || "Claude ended the turn with an execution error.";

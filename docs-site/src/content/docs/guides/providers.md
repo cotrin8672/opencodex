@@ -1527,6 +1527,11 @@ CLI headlessly, retaining a native conversation for clients that supply their ow
   boundaries. Missing older native metadata also starts fresh. Conversation IDs remain isolated by
   proxy home, client identity, provider/destination, and conversation versus compaction purpose.
   Claude Code controls prompt-cache breakpoints, so cache savings are not guaranteed.
+- **Token accounting:** each HTTP response reports its own native API usage. A final SDK result
+  also includes earlier tool handoffs in that native turn; OpenCodex uses completed API frames
+  to avoid reporting those calls twice. This prevents inflated token counts from prematurely
+  triggering client compaction. After compaction, only the replacement client history is imported
+  into the new native session; discarded history is not appended on the next turn.
 - **Follow-ups while tools run:** user instructions are saved in a durable queue while external tool
   results are pending. They do not start inference or substitute for actual results. Once the client's
   actual results arrive and are committed, the queued instructions are folded into the context in
@@ -1589,7 +1594,14 @@ CLI headlessly, retaining a native conversation for clients that supply their ow
   full. An exhausted plan is refused locally with HTTP 429 `claude_subscription_cooldown` and a
   `Retry-After` for the reset, instead of starting a CLI that would fail. The answer is cached for
   a minute in `claude-usage-admission.json` under the OpenCodex home (percentages, reset times and
-  a hashed account key only). If the check cannot run, the turn proceeds.
+  a hashed account key only). CLI quota notifications update the fields they actually contain,
+  including notifications received after an HTTP tool handoff. Model completion also schedules
+  a fresh usage read in the background, bypassing that one-minute cache. Simultaneous reads for
+  the same account are combined and start at least five seconds apart, with a trailing read when
+  another completion occurred during an earlier request. There is no idle polling, and these reads
+  do not delay the answer. Failed reads retain the last good values; missing fields stay unknown.
+  Anthropic may update its usage endpoint later, so completion does not guarantee an immediate
+  percentage change. If the preflight check cannot run, the turn proceeds.
 - **Destination:** the canonical row names `https://api.anthropic.com` because that is where the
   subscription's traffic lands. OpenCodex never sends that request itself, and overriding the base
   URL fails closed rather than handing the turn to another environment.

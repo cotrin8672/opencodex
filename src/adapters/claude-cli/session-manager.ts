@@ -1,10 +1,10 @@
-import type { AdapterEvent, OcxMessage, OcxParsedRequest, OcxProviderConfig } from "../../types";
+import type { AdapterEvent, OcxMessage, OcxParsedRequest, OcxProviderConfig, OcxUsage } from "../../types";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { resolve } from "node:path";
 import type { IncomingMeta } from "../base";
 import type { CodeBuddyToolBridge } from "../codebuddy/tool-bridge";
 import { CODEBUDDY_MCP_TOOL_PREFIX, CODEBUDDY_TOOL_LIMITS } from "../codebuddy/tool-bridge";
-import { CodingAgentProtocolError, usageFromResult } from "../coding-agent/protocol";
+import { CodingAgentProtocolError } from "../coding-agent/protocol";
 import { SendBudgetExhaustedError } from "../../lib/upstream-retry";
 import { getConfigDir } from "../../config/paths";
 import { createTranslatorBudget, isTranslatorBudgetExceededError } from "../../lib/translator-budget";
@@ -14,10 +14,11 @@ import { openClaudeSessionJournal, type ClaudeSessionJournal, type ClaudeSession
 import { prepareClaudeToolResults } from "./session-recovery";
 import { claudeHistoryBoundary, claudeInstructionContinuation, extractClaudeInstructions, restoreClaudeInstructions } from "./session-instructions";
 import { planClaudeNativeSession, type ClaudeNativeSessionIO } from "./session-native";
-import { createClaudeSdkStreamState, mapClaudeSdkMessage, releaseClaudeSdkBlocks, type ClaudeSdkStreamState } from "./session-events";
+import { claudeSdkResultUsage, createClaudeSdkStreamState, mapClaudeSdkMessage, releaseClaudeSdkBlocks, sumClaudeSdkUsage, type ClaudeSdkStreamState } from "./session-events";
 import { ClaudeSessionError } from "./session-errors";
 import { ClaudeSessionSetup } from "./session-setup";
 import type { ClaudeSessionWorker, ClaudeWorkerOptions, ClaudeWorkerToolCall } from "./session-worker";
+import type { ClaudeUsageObserver } from "./usage-admission";
 
 export { ClaudeSessionError } from "./session-errors";
 
@@ -32,6 +33,7 @@ export interface ClaudePersistentTurn {
   bridge: CodeBuddyToolBridge;
   effort?: string;
   onCliOutputError?: (message: string) => void;
+  createUsageObserver?: () => ClaudeUsageObserver;
 }
 
 export interface ClaudeSessionManagerDeps {
@@ -80,6 +82,7 @@ type Session = {
   scope: string;
   snapshot: ClaudeSessionSnapshot;
   worker?: ClaudeSessionWorker;
+  usageObserver?: ClaudeUsageObserver;
   configuration?: string;
   catalog?: string;
   active?: Leg;
@@ -91,6 +94,7 @@ type Session = {
   epoch: number;
   queued: QueuedTool[];
   nativeId?: string;
+  nativeTurnUsage?: OcxUsage;
 };
 
 /** One owner per conversation; a disconnected HTTP response does not own the Claude process. */
@@ -260,11 +264,25 @@ export class ClaudeSessionManager {
               const createWorker = this.deps.createWorker ?? (await setup.wait(import("./session-worker"), "loading the Claude worker")).createClaudeSessionWorker;
               const owner = session;
               const epoch = session.epoch;
+              let usageObserver: ClaudeUsageObserver | undefined;
+              try { usageObserver = input.createUsageObserver?.(); } catch { /* Observation is optional. */ }
+              if (usageObserver?.ready) {
+                try { await setup.wait(usageObserver.ready, "binding the Claude usage account"); }
+                catch {
+                  try { usageObserver.finish(); } catch { /* Observation is optional. */ }
+                  usageObserver = undefined;
+                  setup.check();
+                }
+              }
               const starting = createWorker({
                 binary: input.binary, model: input.parsed.modelId, env: input.env, systemPrompt: input.systemPrompt,
                 effort: input.effort, tools: input.bridge.tools, cwd: directory, persistSession: true,
                 ...(resume ? { resume } : { sessionId: session.snapshot.native!.sessionId }),
-                onMessage: message => { if (owner.epoch === epoch) this.onMessage(owner, message); },
+                onMessage: message => {
+                  if (owner.epoch !== epoch) return;
+                  try { usageObserver?.observe(message); } catch { /* Telemetry cannot fail inference. */ }
+                  this.onMessage(owner, message);
+                },
                 onToolCall: (call, signal) => owner.epoch === epoch ? this.onToolCall(owner, call, signal)
                   : Promise.reject(new ClaudeSessionError("The Claude worker was replaced.", "claude_turn_superseded", 499)),
                 onError: error => { if (owner.epoch === epoch) this.fail(owner, error); },
@@ -275,8 +293,12 @@ export class ClaudeSessionManager {
               // The fence ends only after atomic adoption or verified orphan cleanup.
               this.trackClosing(session.scope, starting.then(async worker => {
                 await decision;
-                if (!adopted) await worker.stop();
+                if (!adopted) {
+                  try { await worker.stop(); }
+                  finally { try { usageObserver?.finish(); } catch { /* Cleanup retains its original failure. */ } }
+                }
               }, error => {
+                try { usageObserver?.finish(); } catch { /* Cleanup retains its original failure. */ }
                 if (error instanceof ClaudeSessionError && error.code === "claude_worker_shutdown_failed") throw error;
               }));
               try {
@@ -284,6 +306,7 @@ export class ClaudeSessionManager {
                 setup.check();
                 if (!leg.finished && !this.closed && owner.epoch === epoch) {
                   session.worker = worker;
+                  session.usageObserver = usageObserver;
                   session.configuration = configuration;
                   session.catalog = catalog;
                   adopted = true;
@@ -320,6 +343,7 @@ export class ClaudeSessionManager {
                 const text = steered && newTexts.length ? newTexts.join("\n\n")
                   : buildClaudeSessionCatchUp(input.parsed, input.provider, input.bridge, start);
                 session.nativeId = leg.nativeId;
+                session.nativeTurnUsage = leg.state.sdkReportedUsage = undefined;
                 await setup.wait(session.worker.send(text, { uuid: leg.nativeId }), "writing the Claude input");
               }
             }
@@ -444,6 +468,7 @@ export class ClaudeSessionManager {
       nativeId: crypto.randomUUID(), instructionIds: [], setup,
       done: new Promise(resolve => { settle = resolve; }), settle: () => settle(), release: () => {},
     };
+    leg.state.sdkReportedUsage = session.nativeTurnUsage;
     session.snapshot.turns.push(receipt);
     session.active = leg;
     this.refreshGenerationTimeout(session, leg);
@@ -486,7 +511,7 @@ export class ClaudeSessionManager {
     }
     if (leg.interrupting) {
       if (message.type === "result") {
-        leg.state.partialUsage = usageFromResult(message) ?? leg.state.partialUsage;
+        claudeSdkResultUsage(message, leg.state);
         try { this.finishInterrupted(session); }
         catch (error) { this.fail(session, error instanceof Error ? error : new Error(String(error))); }
       }
@@ -661,6 +686,7 @@ export class ClaudeSessionManager {
     }
     try { this.save(session, draft); }
     catch { this.fail(session, new ClaudeSessionError("The Claude receipt could not be committed; no tool action was released.", "claude_journal_write_failed", 503)); return; }
+    if (phase === "tools") session.nativeTurnUsage = sumClaudeSdkUsage(session.nativeTurnUsage, leg.state.partialUsage);
     this.finishLeg(session, leg);
   }
 
@@ -771,7 +797,9 @@ export class ClaudeSessionManager {
 
   private stopWorker(session: Session): Promise<void> {
     const worker = session.worker;
+    const usageObserver = session.usageObserver;
     session.worker = undefined;
+    session.usageObserver = undefined;
     session.nativeId = undefined;
     session.epoch++;
     session.queued = [];
@@ -779,6 +807,7 @@ export class ClaudeSessionManager {
       let stopped: Promise<void>;
       try { stopped = Promise.resolve(worker.stop()); }
       catch (error) { stopped = Promise.reject(error); }
+      stopped = stopped.finally(() => { try { usageObserver?.finish(); } catch { /* Observation is optional. */ } });
       this.trackClosing(session.scope, stopped);
     }
     for (const pending of session.pending.values()) pending.reject(new Error("The Claude worker stopped."));

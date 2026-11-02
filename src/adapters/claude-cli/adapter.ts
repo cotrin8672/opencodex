@@ -21,7 +21,8 @@ import {
   CODEBUDDY_TOOL_LIMITS,
 } from "../codebuddy/tool-bridge";
 import { CLAUDE_CLI_PROFILES, type ClaudeCliProfile } from "./profiles";
-import { checkClaudeUsageAdmission, containsClaudeResetClock, recordClaudeUsageRefusal, type ClaudeAdmission } from "./usage-admission";
+import { checkClaudeUsageAdmission, containsClaudeResetClock, createClaudeUsageObserver, recordClaudeUsageRefusal, type ClaudeAdmission, type ClaudeUsageObserver } from "./usage-admission";
+import { ClaudeSessionSetup } from "./session-setup";
 import { buildStableClaudeConversationInput, CLAUDE_REPLAY_SYSTEM_PROMPT, stableClaudeToolBridge } from "./stable-replay";
 
 // The coding-agent bridge is protocol-level infrastructure shared with CodeBuddy. Its MCP server
@@ -43,6 +44,7 @@ export type ClaudeCliAdapterDeps = CodingAgentDeps & {
   usageAdmission?: (model: string) => Promise<ClaudeAdmission>;
   /** Records a limit the CLI itself reported; defaults to the shared admission cache. */
   usageRefusal?: (message: string) => void | Promise<void>;
+  usageObserver?: () => ClaudeUsageObserver;
 };
 
 /** Native Claude Code installs under the account's home even when a service has an old PATH. */
@@ -278,6 +280,7 @@ export function createClaudeCliAdapter(provider: OcxProviderConfig, deps: Claude
           await (deps.sessionManager ?? getClaudeSessionManager()).run({ scope, parsed, incoming, provider, binary,
             env: buildChildEnv(profile as ClaudeCliProfile, ""), systemPrompt, bridge: nativeBridge,
             effort: mapReasoningEffort(provider, parsed.modelId, parsed.options.reasoning),
+            createUsageObserver: deps.usageObserver ?? createClaudeUsageObserver,
             onCliOutputError: message => {
               if (containsClaudeResetClock(parsed.modelId)) return;
               void Promise.resolve().then(() => (deps.usageRefusal ?? recordClaudeUsageRefusal)(redactSecrets(message, undefined, provider.apiKey))).catch(() => {});
@@ -335,13 +338,24 @@ export function createClaudeCliAdapter(provider: OcxProviderConfig, deps: Claude
         });
         return;
       }
+      let usageObserver: ClaudeUsageObserver | undefined;
+      try { usageObserver = (deps.usageObserver ?? createClaudeUsageObserver)(); } catch { /* Observation is optional. */ }
       try {
+        if (usageObserver?.ready) {
+          const setup = new ClaudeSessionSetup(5_000, incoming.abortSignal);
+          try { await setup.wait(usageObserver.ready, "binding the Claude usage account"); }
+          catch {
+            try { usageObserver.finish(); } catch { /* Observation is optional. */ }
+            usageObserver = undefined;
+          } finally { setup.dispose(); }
+        }
         await runCodingAgentTurn({
           profiles: CLAUDE_CLI_PROFILES,
           provider,
           parsed,
           incoming,
           emit: withClaudeLoginHint(emit),
+          onCliMessage: message => usageObserver?.observe(message),
           onCliOutputError: message => {
             // The model id is caller input that reaches the CLI verbatim, and the CLI may reflect it
             // inside its own error wording. When the model id itself carries the reset-clock
@@ -360,6 +374,7 @@ export function createClaudeCliAdapter(provider: OcxProviderConfig, deps: Claude
           deps: { ...deps, which: deps.which ?? findClaudeCliBinary },
         });
       } finally {
+        try { usageObserver?.finish(); } catch { /* Observation cannot delay or fail cleanup. */ }
         if (promptDir) await rm(promptDir, { recursive: true, force: true }).catch(() => {});
       }
     },

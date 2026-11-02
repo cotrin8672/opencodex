@@ -126,6 +126,8 @@ export interface CodingAgentTurnInput {
   emit: (event: AdapterEvent) => void;
   /** Observes accepted CLI result/stderr failures, before client-side error decoration. */
   onCliOutputError?: (message: string) => void;
+  /** Optional family observer; telemetry must not change protocol or completion handling. */
+  onCliMessage?: (message: Record<string, unknown>) => void;
   /** Family-specific headless argument builder (tools disabled, model, reasoning, system prompt). */
   buildArgs: (profile: CodingAgentProviderProfile, parsed: OcxParsedRequest, provider: OcxProviderConfig) => string[];
   /** Family-specific scoped env builder (credential + region switch on top of baseScopedEnv). */
@@ -511,6 +513,7 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
     try {
       let initValidated = false;
       for await (const message of readJsonLines(stdout)) {
+        try { input.onCliMessage?.(message); } catch { /* Optional observations cannot fail a turn. */ }
         if (incoming.abortSignal?.aborted) break;
         if (toolBridge) {
           const initError = toolBridgeInitError(message, toolBridge.serverName);
