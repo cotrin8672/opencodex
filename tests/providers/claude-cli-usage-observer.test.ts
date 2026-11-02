@@ -268,6 +268,64 @@ describe("Claude post-completion usage refresh", () => {
     }
   });
 
+  test.each(["null", "throw"])("a %s GET suppresses active retries for 60 seconds while notifications and refusals remain fresh", async failure => {
+    const h = harness(); h.advance();
+    h.setProbe(async () => { if (failure === "throw") throw Error("synthetic failure"); return null; });
+    const observer = createClaudeUsageObserver(h.deps);
+    observer.observe(result("failed")); await settled();
+    const retryAt = h.initial + 61_000;
+    expect(h.snapshot()).toMatchObject({ checkedAt: h.initial, retryAt, quota: quota(h.initial) });
+    h.advance(5000);
+    observer.observe(result("during-cooldown")); await settled();
+    await checkClaudeUsageAdmission("", h.deps);
+    expect(h.probes()).toBe(1);
+    await recordClaudeUsageRefusal("You've hit your limit · resets 3pm (UTC)", h.deps);
+    observer.observe(event("five_hour", 0.48)); await settled();
+    expect(h.snapshot()).toMatchObject({ checkedAt: h.initial, retryAt, refusalUntil: Date.UTC(2026, 10, 2, 15),
+      quota: { fiveHourPercent: 48, weeklyPercent: 20 }, fieldFreshness: { "five_hour.percent": h.initial + 6000 } });
+    h.setProbe(async () => quota(h.initial + 61_000, 55, 65));
+    h.advance(55_000);
+    await Bun.sleep(10); expect(h.probes()).toBe(1);
+    observer.observe(result("after-cooldown")); await settled();
+    expect(h.probes()).toBe(2);
+    expect(h.snapshot()).toMatchObject({ checkedAt: retryAt, refusalUntil: Date.UTC(2026, 10, 2, 15),
+      quota: { fiveHourPercent: 55, weeklyPercent: 65 } });
+    expect(h.snapshot()?.retryAt).toBeUndefined();
+    expect(h.saved()).not.toContain("retryAt");
+    expect((await checkClaudeUsageAdmission("", h.deps)).state).toBe("exhausted");
+  });
+
+  test("failed preflight without a good quota retries only on activity after its cooldown", async () => {
+    const h = harness(false); h.setProbe(async () => null);
+    expect((await checkClaudeUsageAdmission("", h.deps)).state).toBe("unknown");
+    expect(h.snapshot()).toMatchObject({ checkedAt: 0, retryAt: h.initial + 60_000 });
+    h.advance(5000);
+    expect((await checkClaudeUsageAdmission("", h.deps)).state).toBe("unknown");
+    expect(h.probes()).toBe(1);
+    h.advance(55_000); h.setProbe(async () => quota(h.initial + 60_000));
+    await Bun.sleep(10); expect(h.probes()).toBe(1);
+    expect((await checkClaudeUsageAdmission("", h.deps)).state).toBe("available");
+    expect(h.probes()).toBe(2);
+    expect(h.snapshot()?.retryAt).toBeUndefined();
+  });
+
+  test("a cooldown still validates fresh ownership and never supplies the old account to a switched preflight", async () => {
+    const h = harness(); h.advance(61_000); h.setProbe(async () => null);
+    await checkClaudeUsageAdmission("", h.deps);
+    const before = h.saved();
+    const accountB = { key: createHash("sha256").update("cooldown-account-b").digest("hex"), access: "fake-access-b" };
+    h.deps.identity = fresh => fresh ? accountB : h.accountA;
+    expect((await checkClaudeUsageAdmission("", h.deps)).state).toBe("unknown");
+    expect(h.probes()).toBe(1); expect(h.saved()).toBe(before);
+    const tokens: string[] = [];
+    h.deps.identity = () => accountB;
+    h.setProbe(async token => { tokens.push(token); return quota(h.initial + 61_000, 25, 35); });
+    expect((await checkClaudeUsageAdmission("", h.deps)).state).toBe("available");
+    expect(tokens).toEqual(["fake-access-b"]);
+    expect(h.snapshot()).toMatchObject({ identity: accountB.key, quota: { fiveHourPercent: 25, weeklyPercent: 35 } });
+    expect(h.snapshot()?.retryAt).toBeUndefined();
+  });
+
   test("a late preflight GET preserves newer notification fields, including within one clock tick", async () => {
     const h = harness(false);
     const gate = deferred<ProviderQuota | null>(); gates.push(() => gate.resolve(null)); h.setProbe(() => gate.promise);

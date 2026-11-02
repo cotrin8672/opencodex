@@ -16,7 +16,7 @@ export type ClaudeAdmission = {
   resetAt?: number;
   message?: string;
 };
-type Snapshot = { identity: string; checkedAt: number; quota?: ProviderQuota; refusalUntil?: number; fieldFreshness?: Record<string, number> };
+type Snapshot = { identity: string; checkedAt: number; quota?: ProviderQuota; refusalUntil?: number; retryAt?: number; fieldFreshness?: Record<string, number> };
 type Identity = { key: string; access: string };
 export type AdmissionDeps = {
   now?: () => number;
@@ -76,6 +76,7 @@ function load(path: string): Snapshot | undefined {
     const saved = JSON.parse(readFileSync(path, "utf8"));
     if (typeof saved.identity !== "string" || !Number.isFinite(saved.checkedAt)) return;
     if (saved.refusalUntil !== undefined && !finite(saved.refusalUntil)) return;
+    if (saved.retryAt !== undefined && !finite(saved.retryAt)) return;
     if (saved.fieldFreshness !== undefined && (!record(saved.fieldFreshness) || !Object.values(saved.fieldFreshness).every(finite))) return;
     if (saved.quota !== undefined) {
       const q = saved.quota;
@@ -167,6 +168,8 @@ function startProbe(identity: Identity, path: string, deps: AdmissionDeps): Usag
   const work = (async () => {
     const current = await resolveIdentity(deps, true);
     if (!current || current.key !== identity.key) return null;
+    const cached = latest(path, identity.key);
+    if (cached?.retryAt !== undefined && cached.retryAt > (deps.now ?? Date.now)()) return cached;
     let quota: ProviderQuota | null = null;
     try { quota = await (deps.probe ?? readAnthropicUsageQuota)(current.access); } catch { /* Keep the last good measurement on transport failure. */ }
     if ((await resolveIdentity(deps, true))?.key !== identity.key) return null;
@@ -174,7 +177,9 @@ function startProbe(identity: Identity, path: string, deps: AdmissionDeps): Usag
     // Nothing awaits between the latest read, merge and write: notifications and refusals win races.
     const old = latest(path, identity.key);
     const snapshot: Snapshot = {
-      ...old, identity: identity.key, checkedAt: quota || !old?.quota ? at : old.checkedAt,
+      ...old, identity: identity.key, checkedAt: quota ? at : old?.checkedAt ?? 0,
+      // All failed reads wait one cache interval; only later activity initiates another attempt.
+      retryAt: quota ? undefined : at + CACHE_MS,
       ...(quota ? mergeWindows(path, identity.key, old, quotaWindows(quota), at, started, true) : {}),
     };
     save(path, snapshot);

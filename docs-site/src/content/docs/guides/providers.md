@@ -1599,7 +1599,8 @@ CLI headlessly, retaining a native conversation for clients that supply their ow
   a fresh usage read in the background, bypassing that one-minute cache. Simultaneous reads for
   the same account are combined and start at least five seconds apart, with a trailing read when
   another completion occurred during an earlier request. There is no idle polling, and these reads
-  do not delay the answer. Failed reads retain the last good values; missing fields stay unknown.
+  do not delay the answer. Failed reads retain the last good values and postpone further GETs
+  for one minute, while CLI notifications still update observed fields; missing fields stay unknown.
   Anthropic may update its usage endpoint later, so completion does not guarantee an immediate
   percentage change. If the preflight check cannot run, the turn proceeds.
 - **Destination:** the canonical row names `https://api.anthropic.com` because that is where the
