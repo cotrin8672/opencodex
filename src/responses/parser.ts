@@ -626,6 +626,7 @@ export function parseRequest(
         messages.push({
           role: "toolResult", toolCallId: output.call_id,
           toolName: toolInfo.name, toolNamespace: toolInfo.namespace,
+          isCustomToolOutput: true,
           // Same payload shape as function_call_output (codex-rs FunctionCallOutputPayload):
           // string or content items — normalize arrays instead of leaking raw wire blocks.
           content: outputToToolResultContent(output.output), isError: false, timestamp: now,

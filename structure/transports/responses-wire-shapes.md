@@ -23,7 +23,7 @@ The [decoded checkpoint continuation contract](responses.md#decoded-checkpoint-c
 
 ## Direct MCP calls in code mode
 
-On routed bridge or converted-custom passthrough paths, when the request declares a
+Custom tool results parsed by `src/responses/parser.ts` carry internal origin metadata so Claude CLI can apply its [notification result handoff](../providers/claude-cli-replay.md#external-tool-handoff). This metadata is not an upstream field and does not authorize tool execution or result replacement. On routed bridge or converted-custom passthrough paths, when the request declares a
 freeform/custom code-mode `exec`, a structured call to
 `mcp__<server>__<tool>` can be restored as an `exec` call to the matching nested host tool.
 The same applies to a provider-added `default.` prefix when neither explicit `default.` nor

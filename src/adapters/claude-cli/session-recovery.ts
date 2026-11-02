@@ -22,6 +22,26 @@ export function prepareClaudeToolResults(snapshot: ClaudeSessionSnapshot, messag
     left.hash === right.hash && left.content === right.content && left.isError === right.isError;
   const completedResults = new Map(snapshot.turns.filter(turn => turn.phase === "completed")
     .flatMap(turn => turn.calls.flatMap(call => call.result ? [[call.id, call.result] as const] : [])));
+  const customGroups = new Map<string, Array<Extract<OcxMessage, { role: "toolResult" }>>>();
+  for (const message of messages) if (message.role === "toolResult") {
+    const group = customGroups.get(message.toolCallId) ?? [];
+    group.push(message); customGroups.set(message.toolCallId, group);
+  }
+  const merged = new Set<OcxMessage>();
+  for (const group of customGroups.values()) {
+    if (group.length < 2 || !group.every(message => message.isCustomToolOutput === true)) continue;
+    const first = group[0]!;
+    const contents = new Set<string>();
+    for (const message of group) {
+      if (message.isError !== first.isError && !completedResults.has(first.toolCallId)) conflict();
+      contents.add(claudeResult(message).content);
+      if (message !== first) merged.add(message);
+      if (message.containsEncryptedContent) first.containsEncryptedContent = true;
+    }
+    // notify() adds outputs to one custom invocation; commit the whole batch once.
+    first.content = [...contents].join("\n\n");
+  }
+  messages = messages.filter(message => !merged.has(message));
 
   for (const [index, message] of messages.entries()) {
     if (message.role === "toolResult") {

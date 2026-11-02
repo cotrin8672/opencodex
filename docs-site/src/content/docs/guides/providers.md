@@ -1542,6 +1542,9 @@ CLI headlessly, retaining a native conversation for clients that supply their ow
   its original call ID and preserve its namespace, content and error flag while it is outstanding.
   Deduplication uses exact call IDs and stable operation receipts. A new action with a fresh call ID
   can legitimately repeat the same tool name and arguments.
+  Custom code tools can return progress notifications and a final result under one call ID.
+  OpenCodex combines those outputs before acknowledging the result, preserving distinct fragments
+  once without running the tool again. Later changes to an already accepted pending result still fail.
   One-shot compatibility ends the CLI after capturing a tool batch and
   replays the client's results in the next request.
 - **Disconnects and retries:** in persistent mode, the same active input can reconnect for 30 seconds

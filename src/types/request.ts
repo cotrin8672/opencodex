@@ -270,6 +270,8 @@ export interface OcxToolResultMessage {
   content: string | OcxContentPart[];
   /** True when the Responses result contained opaque encrypted output Kiro cannot translate. */
   containsEncryptedContent?: boolean;
+  /** Responses custom tools can append notification outputs under the same call ID. */
+  isCustomToolOutput?: boolean;
   isError: boolean;
   timestamp: number;
 }
