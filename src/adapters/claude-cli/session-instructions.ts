@@ -3,7 +3,7 @@ import { claudeHistory, historyExtends } from "./session-context";
 import { ClaudeSessionError } from "./session-errors";
 import type { ClaudeQueuedInstruction } from "./session-journal";
 
-export function claudeHistoryBoundary(messages: OcxMessage[], history: string[]): number | undefined {
+export function claudeHistoryBoundary(messages: OcxMessage[], history: string[], allowRestoredResults = false): number | undefined {
   if (!history.length) return 0;
   let count = 0;
   let previousAssistant = false;
@@ -20,10 +20,34 @@ export function claudeHistoryBoundary(messages: OcxMessage[], history: string[])
     }
     if (count > history.length) break;
     if (count !== history.length) continue;
-    const prefix = claudeHistory(messages.slice(0, end));
-    if (historyExtends(prefix, history)) return end;
+    const candidate = messages.slice(0, end);
+    const prefix = claudeHistory(candidate);
+    if (historyExtends(prefix, history) || (allowRestoredResults && sameInstructionHistory(candidate, prefix, history))) return end;
   }
   return undefined;
+}
+
+function sameInstructionHistory(messages: OcxMessage[], actual: string[], saved: string[]): boolean {
+  const users = new Set<string>(), results = new Set<string>();
+  for (const message of messages) {
+    if (message.role === "user" || message.role === "toolResult") {
+      (message.role === "user" ? users : results).add(claudeHistory([message])[0]!);
+    }
+  }
+  if (!results.size) return false;
+  // A recovered result can cross a user message, but never an assistant boundary.
+  const group = (history: string[]): string[] => {
+    const ordered: string[] = [], pending: string[] = [];
+    for (const hash of history) {
+      if (results.has(hash)) pending.push(hash);
+      else {
+        if (!users.has(hash)) ordered.push(...pending.splice(0));
+        ordered.push(hash);
+      }
+    }
+    return ordered.concat(pending);
+  };
+  return historyExtends(group(actual), group(saved));
 }
 
 function userText(message: OcxMessage): string {
@@ -95,11 +119,11 @@ export function restoreClaudeInstructions(messages: OcxMessage[], entries: Claud
   for (const entry of entries) {
     if (seen.has(entry.inputHash)) continue;
     seen.add(entry.inputHash);
-    let start = claudeHistoryBoundary(restored, entry.history);
+    let start = claudeHistoryBoundary(restored, entry.history, true);
     if (start === undefined && missing.length) {
       // A later accepted history may include an earlier instruction omitted by the client.
       insert(insertionPoint());
-      start = claudeHistoryBoundary(restored, entry.history);
+      start = claudeHistoryBoundary(restored, entry.history, true);
     }
     if (start === undefined) {
       if (entry.phase === "completed") continue;

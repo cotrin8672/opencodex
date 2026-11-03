@@ -1,9 +1,10 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import * as sessionContext from "../../src/adapters/claude-cli/session-context";
-import { claudeDigest, claudeHistory } from "../../src/adapters/claude-cli/session-context";
+import { claudeDigest, claudeHistory, claudeResult } from "../../src/adapters/claude-cli/session-context";
 import { ClaudeSessionError } from "../../src/adapters/claude-cli/session-errors";
 import { claudeInstructionContinuation, extractClaudeInstructions, restoreClaudeInstructions } from "../../src/adapters/claude-cli/session-instructions";
 import type { ClaudeQueuedInstruction } from "../../src/adapters/claude-cli/session-journal";
+import { prepareClaudeToolResults } from "../../src/adapters/claude-cli/session-recovery";
 import type { OcxMessage } from "../../src/types";
 
 const user = (content: string): OcxMessage => ({ role: "user", content, timestamp: 0 });
@@ -89,6 +90,33 @@ describe("claudeInstructionContinuation", () => {
 });
 
 describe("restoreClaudeInstructions", () => {
+  test.each(["queued", "sent"] as const)("restores %s instructions after a saved tool result moves beside its call", phase => {
+    const beforeResult = user("First instruction");
+    const accepted = entry(["Second instruction"], { phase, history: claudeHistory([...prefix, beforeResult, result]) });
+    const { messages: incoming, recoveredCalls } = prepareClaudeToolResults({
+      version: 1, history: accepted.history, instructions: [accepted],
+      turns: [{ inputHash: claudeDigest("call"), phase: "completed", deliveryStarted: true, events: [], updatedAt: 2,
+        calls: [{ id: "call-A", name: "read_file", arguments: "{}", result: claudeResult(result) }] }],
+    }, [...prefix, beforeResult, user("Next question")]);
+    const restored = restoreClaudeInstructions(incoming, [accepted]);
+    expect(recoveredCalls).toEqual(new Set(["call-A"]));
+    expect(restored).toEqual([
+      ...prefix, result, beforeResult, { role: "user", content: "Second instruction", timestamp: 3 }, user("Next question"),
+    ]);
+    expect(restoreClaudeInstructions(restored, [accepted])).toEqual(restored);
+    expect(extractClaudeInstructions(incoming, accepted.history)).toBeUndefined();
+  });
+
+  test("does not equate a changed result, reordered instructions, or a result moved across an assistant", () => {
+    const a = user("First"), b = user("Second"), answer = assistant("Answer");
+    const accepted = entry(["Queued"], { history: claudeHistory([...prefix, a, result, b, answer]) });
+    for (const incoming of [
+      [...prefix, { ...result, content: "Different" }, a, b, answer],
+      [...prefix, result, b, a, answer],
+      [...prefix, a, b, answer, result],
+    ]) expect(() => restoreClaudeInstructions(incoming, [accepted])).toThrow(ClaudeSessionError);
+  });
+
   test.each(["queued", "sent", "completed"] as const)("replays %s text absent from client history before the following user", phase => {
     const messages = [...prefix, result, user("Now summarize")];
     const before = structuredClone(messages);

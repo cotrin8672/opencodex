@@ -1468,6 +1468,9 @@ CLI headlessly, retaining a native conversation for clients that supply their ow
 }
 ```
 
+- **Resuming after a tool call:** if the client omits a tool result that OpenCodex has already
+  saved, OpenCodex restores it next to the original call. An intervening follow-up instruction
+  remains in the conversation, without issuing the tool again.
 - **Prerequisites:** install the official native Claude Code executable, then sign in once with
   `claude` (or `claude setup-token`). Persistent sessions require a native binary (`claude.exe` on
   Windows); a `.cmd` or `.bat` launcher is refused with `cli_native_binary_required`. The CLI is
